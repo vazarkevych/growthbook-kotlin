@@ -35,6 +35,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the revalidating network round fails, so an offline client keeps its stale flags instead of falling
   back to code defaults. Default false fails closed (nothing stale served past the ceiling). The
   freshness ceiling still holds whenever the network is reachable.
+- Reactive feature-observation API. `GrowthBookSDK.featuresStateFlow: StateFlow<GBFeatures>` exposes
+  the current feature map as a coroutine flow, and `GrowthBookSDK.featureFlow(id): Flow<GBFeatureResult>`
+  streams a single feature's evaluated result (de-duplicated via `distinctUntilChanged`). Both derive
+  from a single observable state snapshot on the context, so they can never diverge from the evaluated
+  state under concurrent writers. `featuresStateFlow` emits on every feature change — network fetch,
+  disk cache, `setInitialFeatures` seed, `setEncryptedFeatures`, and SSE. `featureFlow(id)`
+  re-evaluates on any change that can affect the result — feature definitions **and** attributes,
+  attribute overrides, forced features and saved groups — and its reactive re-evaluations use a fully
+  silent evaluation: they fire **neither** the `featureUsageCallback` **nor** the experiment
+  `trackingCallback` (and do not touch the tracking-dedup state), so observing a feature via the flow
+  inflates neither usage analytics nor experiment exposures — only explicit `feature()` access reports
+  usage and fires exposures. Both are `@HiddenFromObjC` (Kotlin `Flow` has no native Objective-C
+  representation); Apple consumers read `getFeatures()` or bridge via SKIE.
+- `GrowthBookSDK.refreshCacheSuspend(): Boolean` — coroutine variant of `refreshCache()` that awaits
+  the network round and returns `true` on success. A 304 Not Modified counts as success only when a
+  payload has already been loaded (cached payload stays valid); a 304 before any payload exists returns
+  `false`, as does a failed round. In remote-eval mode it issues the personalized remote-eval POST
+  (same path as `suspendFeature()`), so it never surfaces non-personalized definitions.
 
 ### Fixed
 - Remote evaluation now re-runs when user attributes or forced features change:
