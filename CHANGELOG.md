@@ -6,7 +6,56 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
-## [8.0.0] - Unreleased
+## [8.1.0] - Unreleased
+
+### Added
+- **Feature refresh listeners.** `GrowthBookSDK.addFeatureRefreshListener(GBFeatureRefreshListener)` registers an
+  observer of every refresh attempt and returns a `GBFeatureRefreshSubscription` to cancel it again;
+  `clearFeatureRefreshListeners()` drops them all, as does `close()`. Unlike the single
+  `setRefreshHandler` callback — fixed at build time and limited to remote results — there may be any number of
+  listeners, they can be added and cancelled at any point in the instance's life, and they also hear the cache
+  loads a session starts with.
+    - `GBSDKBuilder.addFeatureRefreshListener(...)` registers one **before** the instance exists. This
+      is not the same as adding it right after `initialize()`: the cached payload is served
+      synchronously from inside `initialize()`, so a listener attached afterwards has already missed
+      the cold start. Register on the builder for anything that must observe it; register on the
+      instance for subscriptions that come and go with a screen.
+    - Each attempt arrives as a `GBFeatureRefreshEvent(success, source, features, error)`, where
+      `GBFeatureRefreshSource` is `Network`, `Cache`, `NotModified` or `Stale`. `Stale` is the stale-if-error
+      fallback (`setServeStaleOnError`): definitions were applied, but only because the refresh failed, so it
+      reports `success = false` with the causing error — an outcome the refresh handler's `(Boolean, GBError?)`
+      contract cannot express, and therefore still does not report.
+    - Exactly one event per payload, raised after everything that payload changed has been applied, so a listener
+      may call back into the SDK. (The refresh handler still fires twice for a payload carrying both features and
+      saved groups; that behaviour is unchanged.)
+    - Listeners are invoked on the SDK's payload-processing dispatcher — a background thread. One that throws is
+      logged and skipped without affecting the other listeners or the refresh itself. Registering the same lambda
+      twice yields two independent subscriptions, and `cancel()` is idempotent.
+- `GrowthBookExt` 2.1.0 adds `GrowthBookSDK.featureRefreshFlow(): Flow<GBFeatureRefreshEvent>`, which ties the
+  subscription to the collecting coroutine. See the [extension changelog](CHANGELOG-GrowthBookExt.md).
+
+### Changed
+- `GrowthBookSDK.getAttributeOverrides()` now returns `Map<String, GBValue>` instead of `Map<String, Any>`. The
+  values always were `GBValue` — only the declared type was widened, forcing a cast at the call site that
+  `getForcedFeatures()` never required.
+    - **Binary compatibility is unaffected**: the JVM signature is `()Ljava/util/Map;` either way, so
+      already-compiled callers keep working. Kotlin source is unaffected too — `Map` is covariant in its
+      value type. Java source may need a retype, since Java generics are invariant:
+      `Map<String, Object> o = sdk.getAttributeOverrides();` no longer compiles, `Map<String, GBValue>`
+      does.
+    - **Swift/Objective-C consumers must recompile**: the exported type changes from `[String : Any]` to
+      `[String : GBValue]`. Code that already treated the values as `GBValue` needs no edit beyond dropping now
+      redundant casts.
+
+### Documentation
+- KDoc for the public API that had none: `IGrowthBookSDK` and all its members, `GBCachingLayer.saveContent` /
+  `getContent` (including that implementations must not throw — the SDK does not guard the call, so an exception
+  propagates into `initialize()`), the `Crypto` interface and the top-level decryption helpers, the
+  `GBTrackingCallback` / `GBFeatureUsageCallback` / `GBExperimentRunCallback` aliases, `setFeaturesChangeHandler`,
+  `getForcedFeatures`, and `startAutoRefreshFeatures` (its mutual exclusion with background polling).
+
+---
+## [8.0.0] - 2026-09-09
 
 ### Added
 - **Contextual bandits.** The SDK now understands contextual bandit rules and their definitions in the features payload

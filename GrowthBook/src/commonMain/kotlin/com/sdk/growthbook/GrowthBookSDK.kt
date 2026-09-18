@@ -38,6 +38,8 @@ import com.sdk.growthbook.kotlinx.serialization.from
 import com.sdk.growthbook.logger.GB
 import com.sdk.growthbook.plugin.tracking.PluginRegistry
 import com.sdk.growthbook.model.GBContextualBandit
+import com.sdk.growthbook.model.GBFeatureRefreshEvent
+import com.sdk.growthbook.model.GBFeatureRefreshSource
 import com.sdk.growthbook.model.StackContext
 import com.sdk.growthbook.utils.GBFeaturesChangeHandler
 import com.sdk.growthbook.sandbox.CachingImpl
@@ -45,14 +47,45 @@ import com.sdk.growthbook.sandbox.GBCachingLayer
 import com.sdk.growthbook.sandbox.GBCachingLayerAdapter
 import com.sdk.growthbook.utils.GBUtils.Companion.refreshStickyBuckets
 import com.sdk.growthbook.model.diffFeatures
+import com.sdk.growthbook.utils.GBFeatureRefreshListener
+import com.sdk.growthbook.utils.GBFeatureRefreshSubscription
 import kotlinx.coroutines.launch
+import kotlin.concurrent.atomics.AtomicReference
+import kotlin.concurrent.atomics.ExperimentalAtomicApi
 import kotlin.coroutines.CoroutineContext
+import kotlin.coroutines.cancellation.CancellationException
 import kotlin.experimental.ExperimentalObjCRefinement
 import kotlin.native.HiddenFromObjC
 import kotlin.time.Duration.Companion.milliseconds
 
+/**
+ * Called the first time a user is exposed to an experiment, and the hook through which assignments
+ * reach your analytics. Required at build time ([GBSDKBuilder]) because an experiment nobody
+ * records is an experiment nobody can read: without it the SDK still assigns variations, but no
+ * result can ever be computed.
+ *
+ * Deduplicated per experiment key, so it fires once per exposure rather than once per evaluation,
+ * and it runs on whichever thread evaluated the feature.
+ */
 typealias GBTrackingCallback = (GBExperiment, GBExperimentResult) -> Unit
+
+/**
+ * Called on **every** feature evaluation, whatever the outcome — defaults and unknown features
+ * included. Intended for usage analytics and debugging ("which flags does this screen read?"),
+ * not for experiment exposure, which is [GBTrackingCallback]'s job.
+ *
+ * Runs inline on the evaluating thread: keep it cheap, and never log attribute values through it.
+ */
 typealias GBFeatureUsageCallback = (featureKey: String, gbFeatureResult: GBFeatureResult) -> Unit
+
+/**
+ * Called when a user's assigned variation for an experiment changes — mirrors the TypeScript SDK's
+ * `subscribe()`.
+ *
+ * Note there is currently no public way to register one: the SDK keeps the subscription list but
+ * exposes no add/remove. The alias is kept because removing it would break source compatibility;
+ * do not plan around it until a registration API lands.
+ */
 typealias GBExperimentRunCallback = (GBExperiment, GBExperimentResult) -> Unit
 
 /**
@@ -60,6 +93,7 @@ typealias GBExperimentRunCallback = (GBExperiment, GBExperimentResult) -> Unit
  * that takes a Context object in the constructor.
  * It exposes two main methods: feature and run.
  */
+@OptIn(ExperimentalAtomicApi::class)
 class GrowthBookSDK internal constructor(
     private val gbContext: GBContext,
     gbOptions: GBOptions,
@@ -95,7 +129,12 @@ class GrowthBookSDK internal constructor(
     // so the public constructor below preserves the pre-7.4.0 signature and delegates here.
     cachingLayer: GBCachingLayer?,
     // Internal seam only, same reasoning: set via GBSDKBuilder.setFetchStatsHandler().
-    private val fetchStatsHandler: GBFetchStatsHandler? = null
+    private val fetchStatsHandler: GBFetchStatsHandler? = null,
+    // Listeners registered through GBSDKBuilder.addFeatureRefreshListener(), seeded into the
+    // registry below before the init block runs. That ordering is the whole point: the first cache
+    // load is served synchronously from inside initialize(), so a listener attached afterwards can
+    // never see it.
+    initialRefreshListeners: List<GBFeatureRefreshListener> = emptyList()
     ) : FeaturesFlowDelegate, IGrowthBookSDK {
 
     /**
@@ -133,6 +172,12 @@ class GrowthBookSDK internal constructor(
     // payload — otherwise a 304 arriving before the first remote fetch would be treated
     // as a failure, breaking the offline-first fallback.
     private var hasFeaturesPayload: Boolean = gbContext.features.isNotEmpty()
+    // Seeded from the builder in the property initializer, i.e. before the init block below issues
+    // the first fetch — otherwise the cache load that fetch serves synchronously would be reported
+    // to an empty registry.
+    private val refreshListeners = AtomicReference(
+        initialRefreshListeners.map { GBFeatureRefreshSubscription(it, ::removeFeatureRefreshListener) }
+    )
     var pluginRegistry: PluginRegistry? = null
 
     /**
@@ -214,6 +259,14 @@ class GrowthBookSDK internal constructor(
      *
      * This method establishes a persistent SSE connection and emits updates
      * whenever features change on the server.
+     *
+     * SSE and background polling are mutually exclusive, and SSE wins: calling this stops any
+     * running poller, and a later [startPolling] is a no-op while the connection is up. The
+     * returned flow only mirrors what arrives — the payload is applied to this instance whether or
+     * not anyone collects it, and refresh listeners / handlers fire either way. Collect it when you
+     * want the updates as a stream; otherwise just call it and let the SDK keep itself current.
+     *
+     * The connection is torn down by [close].
      */
     fun startAutoRefreshFeatures(): Flow<Resource<GBFeatures?>> {
         return featuresViewModel.autoRefreshFeatures()
@@ -255,14 +308,17 @@ class GrowthBookSDK internal constructor(
     /**
      * Releases resources held by this SDK instance: flushes registered plugins (including the
      * built-in tracking plugin) so any buffered events are sent, stops any active SSE auto-refresh
-     * connection or background polling, and cancels the background coroutine scope used to process
-     * fetched payloads. Call this when the instance is no longer needed (e.g. on logout, or before
+     * connection or background polling, cancels the background coroutine scope used to process
+     * fetched payloads, and drops every registered feature refresh listener so nothing this
+     * instance held keeps an observer alive. Call this when the instance is no longer needed
+     * (e.g. on logout, or before
      * creating a replacement instance) to avoid leaking coroutines and threads. Safe to call
      * multiple times. The instance must not be used after [close].
      */
     fun close() {
         pluginRegistry?.closeAll()
         featuresViewModel.close()
+        clearFeatureRefreshListeners()
     }
 
     /**
@@ -270,36 +326,6 @@ class GrowthBookSDK internal constructor(
      */
     fun getFeatures(): GBFeatures {
         return gbContext.features
-    }
-
-    /**
-     * Delegate that fire refreshHandler with success = true when a 304 response occurs.
-     * Only treated as success when the SDK instance has a loaded feature payload.
-     * Without prior state a 304 cannot guarantee features are available
-     */
-    override fun featuresNotModified() {
-        if (!hasFeaturesPayload) {
-            if (gbContext.enableLogging) {
-                GB.log(
-                    "GrowthBookSDK: Received 304 but no feature payload has been loaded by GrowthBook instance - treating as fetch failure so features are retried."
-                )
-            }
-            remoteSourceFeaturesFetchResult = FeaturesFetchResult.Failed
-            invokeRefreshHandler(
-                false,
-                GBError(Exception("304 received before any feature payload was loaded"))
-            )
-            return
-        }
-        remoteSourceFeaturesFetchResult = FeaturesFetchResult.Success
-
-        if (gbContext.enableLogging) {
-            GB.log(
-                "GrowthBookSDK: Features not modified (304), cached data is still valid. " +
-                    "Invoking refreshHandler with success=true"
-            )
-        }
-        invokeRefreshHandler(true, null)
     }
 
     /**
@@ -322,14 +348,25 @@ class GrowthBookSDK internal constructor(
     }
 
     /**
-     * Delegate which inform that fetching features failed
+     * Delegate which inform that fetching features failed.
+     *
+     * The refresh handler is told only about remote failures — a failed cache read is not a
+     * refresh result. Feature refresh listeners are told about both, with [isRemote] surfacing as
+     * [GBFeatureRefreshSource.Network] or [GBFeatureRefreshSource.Cache]: a listener driving UI
+     * needs to know the SDK is evaluating against whatever it had, whichever source let it down.
      */
     override fun featuresFetchFailed(error: GBError, isRemote: Boolean) {
-
         if (isRemote) {
             remoteSourceFeaturesFetchResult = FeaturesFetchResult.Failed
             invokeRefreshHandler(false, error)
         }
+
+        notifyFeatureRefresh(
+            success = false,
+            source = if (isRemote) GBFeatureRefreshSource.Network else GBFeatureRefreshSource.Cache,
+            features = gbContext.features,
+            error = error
+        )
     }
 
     override fun savedGroupsFetchFailed(error: GBError, isRemote: Boolean) {
@@ -340,17 +377,24 @@ class GrowthBookSDK internal constructor(
 
     /**
      * Applies a successfully fetched payload: every field it carries lands in the context in a
-     * single atomic update, then the refresh/features-change handlers fire.
+     * single atomic update, then the refresh/features-change handlers fire and, last, the feature
+     * refresh listeners.
      *
      * One update rather than one per field because payload application runs on a background
      * dispatcher: a feature() call from the app thread could otherwise land mid-way and evaluate new
      * features against the previous generation's bandit definitions or saved groups.
+     *
+     * The listener notification is deliberately last and outside every branch below: exactly one
+     * event per payload, whatever fields it carried, raised only once this instance is fully
+     * updated — a listener may call straight back into the SDK.
      */
     override fun payloadFetchedSuccessfully(
         features: GBFeatures?,
         savedGroups: JsonObject?,
         contextualBandits: Map<String, GBContextualBandit>?,
         isRemote: Boolean,
+        staleError: GBError?,
+        fromCache: Boolean,
     ) {
         // Compute the diff only for authoritative results (network / SSE / fresh cache), against the
         // features currently applied. The non-authoritative cache pre-load that precedes a network
@@ -368,6 +412,7 @@ class GrowthBookSDK internal constructor(
 
         if (features != null) {
             hasFeaturesPayload = true
+
             if (isRemote) {
                 remoteSourceFeaturesFetchResult = FeaturesFetchResult.Success
                 invokeRefreshHandler(true, null)
@@ -378,6 +423,96 @@ class GrowthBookSDK internal constructor(
         if (savedGroups != null && isRemote) {
             invokeRefreshHandler(true, null)
         }
+
+        // Last, and outside both branches above: one event per payload, whichever fields it
+        // carried, and only once everything it did carry is applied — a listener is free to call
+        // back into the SDK. A payload without features leaves the definitions untouched, so the
+        // event reports the ones still in effect.
+        notifyFeatureRefresh(
+            success = staleError == null,
+            // fromCache, not isRemote: a cache entry inside its freshness window is served as
+            // authoritative without any network call, so isRemote alone would label a disk read
+            // "Network".
+            source = when {
+                staleError != null -> GBFeatureRefreshSource.Stale
+                fromCache -> GBFeatureRefreshSource.Cache
+                else -> GBFeatureRefreshSource.Network
+            },
+            features = features ?: gbContext.features,
+            error = staleError
+        )
+    }
+
+    /**
+     * Binary-compatibility shim. 8.0.0 exported this delegate method with four parameters; the
+     * `staleError` / `fromCache` arguments added in 8.1.0 live on the (internal) interface as
+     * defaults, which produces no bridge on the class, so a consumer compiled against the old
+     * signature would hit a NoSuchMethodError without this.
+     */
+    fun payloadFetchedSuccessfully(
+        features: GBFeatures?,
+        savedGroups: JsonObject?,
+        contextualBandits: Map<String, GBContextualBandit>?,
+        isRemote: Boolean,
+    ) = payloadFetchedSuccessfully(
+        features = features,
+        savedGroups = savedGroups,
+        contextualBandits = contextualBandits,
+        isRemote = isRemote,
+        staleError = null,
+        fromCache = !isRemote,
+    )
+
+    /**
+     * Delegate that fire refreshHandler with success = true when a 304 response occurs.
+     * Only treated as success when the SDK instance has a loaded feature payload.
+     * Without prior state a 304 cannot guarantee features are available
+     *
+     * Feature refresh listeners see the same split: [GBFeatureRefreshSource.NotModified] with
+     * `success = true` for the ordinary case, and a failed [GBFeatureRefreshSource.Network] event
+     * for a 304 that arrived before any payload was loaded.
+     */
+    override fun featuresNotModified() {
+        if (!hasFeaturesPayload) {
+            if (gbContext.enableLogging) {
+                GB.log(
+                    "GrowthBookSDK: Received 304 but no feature payload has been loaded by GrowthBook instance - treating as fetch failure so features are retried."
+                )
+            }
+
+            remoteSourceFeaturesFetchResult = FeaturesFetchResult.Failed
+            val featuresNotModifiedError = GBError(Exception("304 received before any feature payload was loaded"))
+
+            invokeRefreshHandler(
+                false,
+                featuresNotModifiedError
+            )
+
+            // Last, as in payloadFetchedSuccessfully: a consumer wiring up both a refresh handler
+            // and a listener sees them in the same order on every path.
+            notifyFeatureRefresh(
+                success = false,
+                source = GBFeatureRefreshSource.Network,
+                features = gbContext.features,
+                error = featuresNotModifiedError
+            )
+            return
+        }
+        remoteSourceFeaturesFetchResult = FeaturesFetchResult.Success
+
+        if (gbContext.enableLogging) {
+            GB.log(
+                "GrowthBookSDK: Features not modified (304), cached data is still valid. " +
+                    "Invoking refreshHandler with success=true"
+            )
+        }
+        invokeRefreshHandler(true, null)
+
+        notifyFeatureRefresh(
+            success = true,
+            source = GBFeatureRefreshSource.NotModified,
+            features = gbContext.features
+        )
     }
 
     /**
@@ -632,10 +767,24 @@ class GrowthBookSDK internal constructor(
         refreshForRemoteEval()
     }
 
-    fun getAttributeOverrides(): Map<String, Any> {
+    /**
+     * The attribute overrides currently in effect, as set by [setAttributeOverrides]. These shadow
+     * the corresponding entries of the context's attributes during evaluation; an empty map means
+     * evaluation sees the attributes as they were set.
+     *
+     * A snapshot, not a view: later overrides do not show up in a map already returned.
+     */
+    fun getAttributeOverrides(): Map<String, GBValue> {
         return gbContext.attributeOverrides
     }
 
+    /**
+     * The feature values currently forced through [setForcedFeatures], keyed by feature id. A
+     * forced value wins over every rule, which makes this the first thing to check when a feature
+     * evaluates to something the rules cannot explain.
+     *
+     * A snapshot, not a view, as with [getAttributeOverrides].
+     */
     fun getForcedFeatures(): Map<String, GBValue> = gbContext.forcedFeatures
 
     /**
@@ -700,6 +849,110 @@ class GrowthBookSDK internal constructor(
     @PublishedApi
     internal inline fun <reified V> extractFeatureValue(id: String): V? =
         this.feature(id).extractValue()
+
+    /**
+     * Drops every registered feature refresh listener at once, as [close] does. Use it when the
+     * host is tearing down a whole screen's worth of subscriptions and holding each
+     * [GBFeatureRefreshSubscription] would be busywork; prefer cancelling individual
+     * subscriptions when other parts of the app may also be listening.
+     */
+    fun clearFeatureRefreshListeners() = mutateListeners { emptyList() }
+
+    /**
+     * Registers [listener] to be called after every feature refresh attempt — network, cache load,
+     * 304 and failure alike — and returns the handle that removes it again.
+     *
+     * Any number of listeners can be registered, at any point in this instance's life, unlike the
+     * single handler passed to [GBSDKBuilder.setRefreshHandler]. Listeners are also told about
+     * definitions loaded from the cache, which the refresh handler does not report.
+     *
+     * ```kotlin
+     * val subscription = sdk.addFeatureRefreshListener { event ->
+     *     if (event.success) redrawFromFeatures(event.features)
+     * }
+     * // later, e.g. in onCleared()
+     * subscription.cancel()
+     * ```
+     *
+     * Listeners are invoked on the SDK's payload-processing dispatcher (the platform IO dispatcher
+     * by default), so marshal back to the UI thread yourself. One that throws is logged and
+     * skipped: it stops neither the other listeners nor the refresh.
+     *
+     * @return a subscription whose [GBFeatureRefreshSubscription.cancel] removes this registration
+     *   and no other — registering the same lambda twice yields two independent subscriptions.
+     * @see GBSDKBuilder.setRefreshHandler
+     */
+    fun addFeatureRefreshListener(listener: GBFeatureRefreshListener): GBFeatureRefreshSubscription {
+        val sub = GBFeatureRefreshSubscription(listener, ::removeFeatureRefreshListener)
+        mutateListeners { list -> list + sub }
+        return sub
+    }
+
+    /**
+     * Removes one registration, matched by identity (`!==`) rather than equality: two
+     * subscriptions over the same lambda are distinct, and cancelling one must not take the other
+     * with it. Dropping a subscription that is no longer in the list is a no-op, which is what
+     * makes [GBFeatureRefreshSubscription.cancel] idempotent.
+     */
+    private fun removeFeatureRefreshListener(sub: GBFeatureRefreshSubscription) {
+        mutateListeners { list -> list.filter { it !== sub } }
+    }
+
+    /**
+     * Builds one [GBFeatureRefreshEvent] and hands it to every listener registered at this moment.
+     *
+     * Call it exactly once per refresh outcome, and only after everything that outcome changed has
+     * been applied — a listener may call straight back into the SDK, and must not observe a
+     * half-updated instance. The event is constructed only when someone is listening, since the
+     * common case is no listeners at all.
+     *
+     * Iterating the snapshot taken up front (rather than the live registry) is deliberate: a
+     * listener is free to add or cancel subscriptions, including its own, while being called.
+     *
+     * @param features the definitions this refresh applied, or the ones still in effect when it
+     *   applied none (304, failure, a payload carrying only saved groups).
+     */
+    private fun notifyFeatureRefresh(
+        success: Boolean,
+        source: GBFeatureRefreshSource,
+        features: GBFeatures,
+        error: GBError? = null
+    ) {
+        val subs = refreshListeners.load()
+        if (subs.isEmpty()) return
+        val event = GBFeatureRefreshEvent(success, source, features, error)
+        for (sub in subs) {
+            try {
+                sub.listener.invoke(event)
+            } catch (cancellation: CancellationException) {
+                // Cancellation is the caller's coroutine being torn down, not a misbehaving
+                // listener: it must propagate so close()/scope cancellation keep working.
+                throw cancellation
+            } catch (t: Throwable) {
+                // Throwable, not Exception: notification runs inside handleNetworkModel's own
+                // catch(Throwable), so an Error escaping a listener (NotImplementedError from an
+                // unfinished stub, a failed assertion, a JS-thrown non-Exception) would be
+                // re-dispatched as a failed fetch — reporting a refresh that already applied its
+                // payload as broken. Matches PluginRegistry.
+                if (gbContext.enableLogging) {
+                    GB.error("GrowthBook: feature refresh listener threw and was ignored: ${t.message}", t)
+                }
+            }
+        }
+    }
+
+    /**
+     * Applies [transform] to the listener registry under a compare-and-set loop, mirroring
+     * [com.sdk.growthbook.model.GBContext]'s `mutate`. The list is replaced wholesale rather than
+     * mutated in place, so a notification iterating an earlier snapshot is unaffected, and
+     * concurrent registrations from different threads cannot clobber each other.
+     */
+    private fun mutateListeners(transform: (List<GBFeatureRefreshSubscription>) ->(List<GBFeatureRefreshSubscription>)) {
+        while (true) {
+            val current = refreshListeners.load()
+            if (refreshListeners.compareAndSet(current, transform(current))) return
+        }
+    }
 
     /**
      * Builds the remote-eval request payload from the current context, or null when not in
