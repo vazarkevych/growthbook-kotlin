@@ -354,6 +354,11 @@ internal class GBConditionEvaluator {
         if (attributeValue is GBArray) {
             // Loop through items in attributeValue
             for (item in attributeValue) {
+                // Skip null elements only, like the reference SDK. Falsy-but-present members
+                // (0, false, "") are valid values and must still be tested against the condition
+                // — guarding on truthiness instead is the defect sdk-js fixed in #6323.
+                if (item is GBNull) continue
+
                 val attributes = if (item is GBJson) {
                     HashMap(item)
                 } else {
@@ -421,6 +426,59 @@ internal class GBConditionEvaluator {
             }
         }
 
+        // Evaluate EQ / NE. Dispatched on the operator alone so the pair stays a strict negation
+        // for every shape of value: reaching them only for a primitive attribute made both answer
+        // false for an array or object, which cannot be right either way round.
+        //
+        // The reference SDK compares with `===`, which is value equality for primitives but
+        // reference identity for arrays and objects. A condition and an attribute are always
+        // decoded from separate JSON, so a non-primitive operand can never be identical — `$eq` is
+        // false and `$ne` true regardless of the contents. That is reproduced rather than
+        // "improved" into a deep comparison: a deep `$eq` would match here and not on the other
+        // SDKs, and a rule that behaves differently per platform is worse than one that is
+        // uniformly useless. Note plain equality (`{"tags": ["a"]}`) does compare deeply, in this
+        // SDK and in the reference alike — that inconsistency is inherited, not introduced here.
+        if (operator == "\$eq" || operator == "\$ne") {
+            val equal = attributeValue != null &&
+                attributeValue.isPrimitiveValue() &&
+                conditionValue.isPrimitiveValue() &&
+                attributeValue == conditionValue
+            return if (operator == "\$eq") equal else !equal
+        }
+
+        // Evaluate the version operators. Dispatched on the operator alone, like the reference
+        // SDK: `asVersionInput` already renders every shape of value, so there is nothing for an
+        // attribute-shape branch to decide. Reaching them only for a primitive attribute made an
+        // array or object attribute skip the comparison and fall through to false, where the
+        // reference SDK compares it as version "0" (`$veq - array attribute is version 0`).
+        val compareVersions: ((String, String) -> Boolean)? = when (operator) {
+            "\$veq" -> { source, target -> source == target }
+            "\$vne" -> { source, target -> source != target }
+            "\$vgt" -> { source, target -> source > target }
+            "\$vgte" -> { source, target -> source >= target }
+            "\$vlt" -> { source, target -> source < target }
+            "\$vlte" -> { source, target -> source <= target }
+            else -> null
+        }
+        if (compareVersions != null) {
+            return compareVersions(
+                GBUtils.paddedVersionString(attributeValue.asVersionInput()),
+                GBUtils.paddedVersionString(conditionValue.asVersionInput()),
+            )
+        }
+
+        // Evaluate INGROUP / NOTINGROUP operators - whether the attribute is a member of a saved
+        // group. Dispatched on the operator alone, like the reference SDK, rather than from the
+        // attribute-shape branches below: `isIn` already covers an array attribute (intersection),
+        // a primitive one, and an absent one. Reaching these only for a primitive attribute made
+        // both operators answer false for a multi-value attribute such as `tags: ["a", "b"]`, so
+        // an exclusion by saved group silently matched nobody — and so did its inclusion twin.
+        if (operator == "\$inGroup" || operator == "\$notInGroup") {
+            val group = savedGroups?.get(conditionValue.asKey()) as? GBArray ?: GBArray(emptyList())
+            val isMember = isIn(attributeValue, group)
+            return if (operator == "\$inGroup") isMember else !isMember
+        }
+
         /// There are three operators where conditionValue is an array
         if (conditionValue is GBArray) {
             when (operator) {
@@ -476,13 +534,6 @@ internal class GBConditionEvaluator {
                 }
             }
         } else if (attributeValue?.isPrimitiveValue() == true) {
-            val targetPrimitiveValue = conditionValue as? GBString
-            val sourcePrimitiveValue = attributeValue as? GBString
-            val paddedVersionTarget =
-                GBUtils.paddedVersionString(targetPrimitiveValue?.value.orEmpty())
-            val paddedVersionSource =
-                GBUtils.paddedVersionString(sourcePrimitiveValue?.value ?: "0")
-
             fun template(
                 stringComparator: (String, String) -> Boolean,
                 numberComparator: (Double, Double) -> Boolean,
@@ -492,16 +543,6 @@ internal class GBConditionEvaluator {
             )
 
             when (operator) {
-                // Evaluate EQ operator - whether condition equals to attribute
-                "\$eq" -> {
-                    if (sourcePrimitiveValue == null || getType(attributeValue) == GBAttributeType.GbNull) return false
-                    return sourcePrimitiveValue == targetPrimitiveValue
-                }
-                // Evaluate NE operator - whether condition doesn't equal to attribute
-                "\$ne" -> {
-                    // return sourcePrimitiveValue != targetPrimitiveValue
-                    return conditionValue != attributeValue
-                }
                 // Evaluate LT operator - whether attribute less than to condition
                 "\$lt" -> {
                     return template(
@@ -548,61 +589,35 @@ internal class GBConditionEvaluator {
                 }
                 // Evaluate REGEX operator - whether attribute contains condition regex
                 "\$regex" -> {
-                    return evalRegex(conditionValue = targetPrimitiveValue,
-                        attributeValue = sourcePrimitiveValue,
+                    return evalRegex(pattern = conditionValue,
+                        attributeValue = attributeValue.asRegexInput(),
                         ignoreCase = false,
                         negate = false
                     )
                 }
 
                 "\$regexi" -> {
-                    return evalRegex(conditionValue = targetPrimitiveValue,
-                        attributeValue = sourcePrimitiveValue,
+                    return evalRegex(pattern = conditionValue,
+                        attributeValue = attributeValue.asRegexInput(),
                         ignoreCase = true,
                         negate = false
                     )
                 }
 
                 "\$notRegex" -> {
-                    return evalRegex(conditionValue = targetPrimitiveValue,
-                        attributeValue = sourcePrimitiveValue,
+                    return evalRegex(pattern = conditionValue,
+                        attributeValue = attributeValue.asRegexInput(),
                         ignoreCase = false,
                         negate = true
                     )
                 }
 
                 "\$notRegexi" -> {
-                    return evalRegex(conditionValue = targetPrimitiveValue,
-                        attributeValue = sourcePrimitiveValue,
+                    return evalRegex(pattern = conditionValue,
+                        attributeValue = attributeValue.asRegexInput(),
                         ignoreCase = true,
                         negate = true
                     )
-                }
-                // Evaluate VEQ operator - whether versions are equals
-                "\$veq" -> return paddedVersionSource == paddedVersionTarget
-                // Evaluate VNE operator - whether versions are not equals to attribute
-                "\$vne" -> return paddedVersionSource != paddedVersionTarget
-                // Evaluate VGT operator - whether the first version is greater
-                // than the second version
-                "\$vgt" -> return paddedVersionSource > paddedVersionTarget
-                // Evaluate VGTE operator - whether the first version is greater
-                // than or equal the second version
-                "\$vgte" -> return paddedVersionSource >= paddedVersionTarget
-                // Evaluate VLT operator - whether the first version is lesser
-                // than the second version
-                "\$vlt" -> return paddedVersionSource < paddedVersionTarget
-                // Evaluate VLTE operator - whether the first version is lesser
-                // than or equal the second version
-                "\$vlte" -> return paddedVersionSource <= paddedVersionTarget
-                "\$inGroup" -> {
-                    val gbArray =
-                        savedGroups?.get(conditionValue.asKey()) as? GBArray ?: GBArray(emptyList())
-                    return isIn(attributeValue, gbArray)
-                }
-                "\$notInGroup" -> {
-                    val gbArray =
-                        savedGroups?.get(conditionValue.asKey()) as? GBArray ?: GBArray(emptyList())
-                    return !isIn(attributeValue, gbArray)
                 }
             }
         }
@@ -614,6 +629,76 @@ internal class GBConditionEvaluator {
         when (this) {
             is GBString -> this.value // without quotes
             else -> this.toString()
+        }
+
+    /**
+     * The text a version operand contributes to a `$v*` comparison.
+     *
+     * Mirrors the reference SDK's coercion (`util.ts`: a number becomes its string form, and
+     * anything else that is not a non-empty string becomes `"0"`). Casting the operand to
+     * [GBString] instead silently turned a numeric attribute into version `"0"` and a numeric
+     * condition into the empty string, so a payload that sent, say, a build number as a JSON
+     * number never matched any version rule — without an error anywhere.
+     *
+     * An integral number renders without a fractional part (`10`, not `10.0`) because the
+     * reference SDK has a single number type and `10.0 + ""` is `"10"` there; keeping the `.0`
+     * would split into an extra version segment and change the comparison.
+     */
+    private fun GBValue?.asVersionInput(): String =
+        when (this) {
+            is GBString -> value.ifEmpty { "0" }
+            is GBNumber -> asPlainString()
+            else -> "0"
+        }
+
+    /**
+     * The text a `$regex` family operand is matched against.
+     *
+     * The reference SDK passes the attribute straight to `RegExp.prototype.test`, which converts
+     * whatever it gets into a string. Casting to [GBString] instead made every non-string
+     * attribute fail the match outright, so a regex rule on an id or a build number sent as a JSON
+     * number could never match.
+     *
+     * Numbers and booleans are converted; `null` is deliberately **not**. JavaScript would render
+     * it `"null"`, which makes a pattern like `ull` match a user who does not have the attribute
+     * at all — an artefact of the conversion rather than intended targeting, so it is not
+     * reproduced. Array and object attributes never reach here (they are handled by the
+     * attribute-shape branch above) and are likewise not stringified.
+     */
+    private fun GBValue?.asRegexInput(): String? =
+        when (this) {
+            is GBString -> value
+            is GBNumber -> asPlainString()
+            is GBBoolean -> value.toString()
+            else -> null
+        }
+
+    /**
+     * A number rendered as the reference SDK's single number type would render it: an integral
+     * value carries no fractional part (`10`, not `10.0`), matching `String(10.0) === "10"`.
+     *
+     * Integral Kotlin types are printed as they are rather than routed through [Double]. A `Long`
+     * past 2^53 cannot round-trip through a double — `1234567890123456789` comes back as
+     * `1234567890123456768` — and ids of that size are ordinary (a snowflake id is 19 digits), so
+     * normalising first would quietly rewrite the digits a `$regex` rule matches against.
+     *
+     * Only a floating-point value needs the round-trip, which is also what decides whether it is
+     * integral at all. A double too large for [Long] keeps its own notation (`1.0E20` where
+     * JavaScript writes `100000000000000000000`); nothing sane targets a version or a pattern at
+     * such a value, and rendering it faithfully would need arbitrary-precision formatting that
+     * common code does not have.
+     */
+    private fun GBNumber.asPlainString(): String =
+        when (val number = value) {
+            is Byte, is Short, is Int, is Long -> number.toString()
+            else -> {
+                val asDouble = number.toDouble()
+                if (asDouble.isFinite() && asDouble == asDouble.toLong().toDouble()) {
+                    asDouble.toLong().toString()
+                } else {
+                    number.toString()
+                }
+            }
         }
 
     private fun isIn(actualValue: GBValue?, conditionValue: GBArray, inSensitive: Boolean = false): Boolean {
@@ -704,13 +789,24 @@ internal class GBConditionEvaluator {
             else -> 0.0
         }
 
-    private fun evalRegex(conditionValue: GBString?, attributeValue: GBString?, ignoreCase: Boolean, negate: Boolean): Boolean {
-        if (conditionValue == null || attributeValue == null) return false
+    /**
+     * The two operands are treated differently on purpose, following the reference SDK.
+     *
+     * [attributeValue] is data: it arrives already converted by [asRegexInput], because
+     * `RegExp.prototype.test` stringifies whatever it is handed.
+     *
+     * [pattern] is not data — it is compiled. The reference SDK calls `String.replace` on it while
+     * building the `RegExp`, so a pattern that is not a string throws there and is caught as "no
+     * match". Requiring a [GBString] here reproduces that without relying on an exception.
+     */
+    private fun evalRegex(pattern: GBValue, attributeValue: String?, ignoreCase: Boolean, negate: Boolean): Boolean {
+        val patternText = (pattern as? GBString)?.value ?: return false
+        if (attributeValue == null) return false
 
         return try {
             val options = if (ignoreCase) setOf(RegexOption.IGNORE_CASE) else emptySet()
-            val regex = Regex(conditionValue.value, options)
-            val matches = regex.containsMatchIn(attributeValue.value)
+            val regex = Regex(patternText, options)
+            val matches = regex.containsMatchIn(attributeValue)
             if (negate) !matches else matches
         } catch (t: Throwable) {
             false

@@ -6,7 +6,57 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
-## [8.0.0] - Unreleased
+## [8.0.1] - Unreleased
+
+### Fixed
+Targeting-condition operators that silently answered "no match" for whole classes of attribute value. Each was
+found by diffing the evaluator against the reference SDK and is pinned by the shared spec corpus (now 0.8.1) or,
+where the corpus has no case for it, by a dedicated test suite.
+
+- **`$eq` now works for every attribute type, not just strings.** The operator narrowed both operands to a string
+  before comparing, so it answered false for every number and boolean: `{"age": {"$eq": 25}}` did not match an age of
+  25, and `$eq` and `$ne` both reported false for the same pair. It now compares values directly, matching the
+  reference SDK and the plain-equality path (`{"age": 25}`), which were never affected. This also fixes `$elemMatch`
+  bodies such as `{"$elemMatch": {"$eq": 0}}`, which could not match a numeric or boolean element.
+  Integer and floating-point values remain distinct, as everywhere else in the SDK, so `$eq: 25` does not match `25.0`.
+  `$eq` and `$ne` are now also a strict negation of each other for array and object operands, where both used to
+  answer false. They follow the reference SDK's `===`, which is reference identity for those: a condition and an
+  attribute are decoded separately, so `$eq` is false and `$ne` true whatever the contents. Plain equality
+  (`{"tags": ["a"]}`) still compares contents, in this SDK and the reference alike.
+- **`$inGroup` / `$notInGroup` now work for multi-value attributes.** Both operators were only reachable for a
+  primitive attribute, so an array attribute such as `tags: ["a", "b"]` made *both* of them answer false — a rule
+  written as "everyone except this saved group" matched nobody, and its inclusion twin matched nobody either. They are
+  now dispatched on the operator alone, matching the reference SDK: an array attribute is a member of the group when
+  the two intersect. Scalar, absent and null attributes are unchanged.
+- **`$elemMatch` no longer tests null array elements.** Every element was evaluated against the condition, so an array
+  that merely contained a null satisfied any negation-flavoured body — `$ne`, `$nin`, `$exists: false`, `$eq: null`.
+  Null elements are now skipped, matching the reference SDK. Falsy-but-present members (`0`, `false`, `""`) are still
+  tested, so `{"$elemMatch": {"$eq": 0}}` continues to match `[0]`.
+- **Version operators (`$veq`, `$vne`, `$vgt`, `$vgte`, `$vlt`, `$vlte`) now accept numeric operands.** Both sides were
+  cast to a string, so a number fell back to a placeholder — the attribute became version `"0"` and the condition the
+  empty string. An attribute sent as a JSON number, such as an Android `versionCode`, therefore matched no version
+  rule, silently and without an error. Numbers are now coerced to their string form as in the reference SDK, with an
+  integral value rendering without a fractional part (`10`, not `10.0`). Absent, null, boolean and empty-string
+  operands still compare as version `"0"`. Array and object attributes reach the comparison too, instead of skipping
+  it and answering false both ways.
+- **`$regex` / `$regexi` / `$notRegex` / `$notRegexi` now match numeric and boolean attributes.** The attribute was
+  cast to a string, so any other type failed the match outright and a regex rule on an id or build number sent as a
+  JSON number could never fire. Numbers and booleans are converted to their text form, with an integral number
+  rendering without a fractional part. `null`, absent, array and object attributes still never match: the reference
+  SDK renders `null` as the text `"null"`, which would let a pattern such as `ull` match a user who has no such
+  attribute, and that conversion artefact is deliberately not reproduced. The pattern side is unchanged — a
+  non-string pattern is not a match.
+
+### Companion artifacts
+- `GrowthBookExt` **2.0.1** and `GrowthBookTest` **2.0.1** — no source changes. Both declare `GrowthBook` as an `api`
+  dependency, so the published 2.0.0 artifacts pin the transitive version to 8.0.0 and a consumer who depends only on
+  one of them would keep evaluating with the operators fixed above. Republished so the dependency resolves to 8.0.1;
+  staying on 2.0.0 works too, but then `io.growthbook.sdk:GrowthBook:8.0.1` has to be declared explicitly.
+- `Core`, `GrowthBookKotlinxSerialization`, `NetworkDispatcherKtor` and `NetworkDispatcherOkHttp` do not depend on
+  `GrowthBook` at all and are unaffected; they keep their current versions.
+
+---
+## [8.0.0] - 2026-09-09
 
 ### Added
 - **Contextual bandits.** The SDK now understands contextual bandit rules and their definitions in the features payload
