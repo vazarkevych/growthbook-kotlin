@@ -72,6 +72,52 @@ class PluginRegistry(plugins: List<GrowthBookPlugin>?) {
         }
     }
 
+    /**
+     * Dispatches an explicit [com.sdk.growthbook.GrowthBookSDK.logEvent] call to the registered
+     * plugins that opted into [CustomEventReceiver]. Plugins that did not are skipped, so this is
+     * a no-op for the ones that only care about evaluations.
+     */
+    fun fireCustomEvent(
+        eventName: String,
+        properties: Map<String, GBValue>,
+        attributes: Map<String, GBValue>? = null
+    ) {
+        if (plugins.isEmpty()) return
+
+        for (plugin in plugins) {
+            if (plugin !is CustomEventReceiver) continue
+            try {
+                plugin.onEvent(eventName, properties, attributes)
+            } catch (t: Throwable) {
+                GB.warning(
+                    "Plugin ${plugin::class.simpleName} " +
+                        "onEvent failed: $t"
+                )
+            }
+        }
+    }
+
+    /**
+     * Tells the plugins that opted into [AttributesChangeReceiver] that the instance now serves a
+     * different user. Plugins that did not are skipped, so this costs nothing for the ones that
+     * hold no per-user state.
+     */
+    fun fireAttributesChanged(attributes: Map<String, GBValue>) {
+        if (plugins.isEmpty()) return
+
+        for (plugin in plugins) {
+            if (plugin !is AttributesChangeReceiver) continue
+            try {
+                plugin.onAttributesChanged(attributes)
+            } catch (t: Throwable) {
+                GB.warning(
+                    "Plugin ${plugin::class.simpleName} " +
+                        "onAttributesChanged failed: $t"
+                )
+            }
+        }
+    }
+
     fun closeAll() {
         if (plugins.isEmpty()) return
 

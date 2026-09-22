@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.1.0] - Unreleased
+
+### Added
+- `eventLogger` in the configuration DSL, mirroring `GBSDKBuilder.setEventLogger`. Receives explicit
+  `GrowthBookSDK.logEvent` calls; see the [core changelog](CHANGELOG.md#810---unreleased).
+
+  ```kotlin
+  val sdk = growthBook {
+      apiKey = "sdk-abc"
+      networkDispatcher = GBNetworkDispatcherKtor()
+      eventLogger = { eventName, properties, _ -> analytics.track(eventName, properties) }
+  }
+  ```
+
+---
+
 ## [2.0.0] - 2026-08-26
 
 No changes to `GrowthBookExt` itself. The major bump propagates the breaking changes in

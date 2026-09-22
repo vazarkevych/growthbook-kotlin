@@ -17,6 +17,7 @@ import com.sdk.growthbook.utils.Resource
 import com.sdk.growthbook.utils.getFeaturesFromEncryptedFeatures
 import com.sdk.growthbook.evaluators.GBExperimentHelper
 import com.sdk.growthbook.evaluators.GBFeatureEvaluator
+import com.sdk.growthbook.evaluators.GBFeatureUsageHelper
 import com.sdk.growthbook.evaluators.GBExperimentEvaluator
 import com.sdk.growthbook.evaluators.UserContext
 import com.sdk.growthbook.features.FeaturesDataModel
@@ -36,6 +37,7 @@ import com.sdk.growthbook.model.GBFeatureResult
 import com.sdk.growthbook.model.GBExperimentResult
 import com.sdk.growthbook.kotlinx.serialization.from
 import com.sdk.growthbook.logger.GB
+import com.sdk.growthbook.plugin.GBEventDispatch
 import com.sdk.growthbook.plugin.tracking.PluginRegistry
 import com.sdk.growthbook.model.GBContextualBandit
 import com.sdk.growthbook.model.StackContext
@@ -54,6 +56,26 @@ import kotlin.time.Duration.Companion.milliseconds
 typealias GBTrackingCallback = (GBExperiment, GBExperimentResult) -> Unit
 typealias GBFeatureUsageCallback = (featureKey: String, gbFeatureResult: GBFeatureResult) -> Unit
 typealias GBExperimentRunCallback = (GBExperiment, GBExperimentResult) -> Unit
+
+/**
+ * Receives every event the SDK produces as one structured stream: `Experiment Viewed` and
+ * `Feature Evaluated` from evaluation, and whatever [GrowthBookSDK.logEvent] is called with.
+ * Registered with [GBSDKBuilder.setEventLogger].
+ *
+ * Event names are the [com.sdk.growthbook.plugin.GBTrackingEventNames] constants and the property
+ * keys of the two built-in events match the other GrowthBook SDKs, so one sink can feed a
+ * warehouse without per-SDK mapping. It fires *in addition to* `trackingCallback`,
+ * [GBSDKBuilder.setFeatureUsageCallback] and any registered plugins — none of them replace each
+ * other.
+ *
+ * Invoked on the evaluating thread. Return quickly and hand slow work (network, disk) to your own
+ * executor; a thrown exception is logged and swallowed.
+ */
+typealias GBEventLogger = (
+    eventName: String,
+    properties: Map<String, GBValue>,
+    attributes: Map<String, GBValue>?
+) -> Unit
 
 /**
  * The main export of the libraries is a simple GrowthBook wrapper class
@@ -125,6 +147,7 @@ class GrowthBookSDK internal constructor(
     private var remoteSourceFeaturesFetchResult: FeaturesFetchResult =
         FeaturesFetchResult.NoResultYet
     private val gbExperimentHelper: GBExperimentHelper = GBExperimentHelper()
+    private val gbFeatureUsageHelper: GBFeatureUsageHelper = GBFeatureUsageHelper()
     private var subscriptions: MutableList<GBExperimentRunCallback> = mutableListOf()
     private var assigned: MutableMap<String, Pair<GBExperiment, GBExperimentResult>> =
         mutableMapOf()
@@ -247,6 +270,31 @@ class GrowthBookSDK internal constructor(
         }
     }
 
+    /**
+     * Logs a custom analytics event through the same pipeline the SDK's own events use: the
+     * [GBSDKBuilder.setEventLogger] sink, and every registered plugin that implements
+     * [com.sdk.growthbook.plugin.tracking.CustomEventReceiver] — including the built-in
+     * [com.sdk.growthbook.plugin.tracking.GrowthBookTrackingPlugin], which batches it to the ingest
+     * endpoint alongside exposures. Mirrors the reference JS SDK's `logEvent`.
+     *
+     * The instance's current attributes are attached automatically, so the event lands with the
+     * same identity as an evaluation made at the same moment. Custom events are never
+     * de-duplicated: logging the same event twice means it happened twice.
+     *
+     * Returns immediately — delivery is the logger's/plugin's concern — and never throws: a
+     * failing consumer callback is logged and swallowed, exactly as evaluation callbacks are, so
+     * analytics can't take down the caller.
+     */
+    fun logEvent(eventName: String, properties: Map<String, GBValue> = emptyMap()) {
+        GBEventDispatch.customEvent(
+            plugins = pluginRegistry,
+            eventLogger = gbContext.eventLogger,
+            eventName = eventName,
+            properties = properties,
+            attributes = gbContext.evalSnapshot().attributes,
+        )
+    }
+
     /** Stops background polling started by [startPolling]. Safe to call when not polling. */
     fun stopPolling() {
         featuresViewModel.stopPolling()
@@ -263,6 +311,8 @@ class GrowthBookSDK internal constructor(
     fun close() {
         pluginRegistry?.closeAll()
         featuresViewModel.close()
+        // Release the per-feature usage history, mirroring the reference SDK's destroy().
+        gbFeatureUsageHelper.reset()
     }
 
     /**
@@ -521,7 +571,7 @@ class GrowthBookSDK internal constructor(
     override fun setAttributes(attributes: Map<String, GBValue>) {
         // Single atomic update so a concurrent feature()/run() never sees the new attributes paired
         // with the previous user's stale sticky docs (the docs are repopulated by the refresh below).
-        gbContext.setAttributesClearingStickyDocs(attributes)
+        notifyAttributesChanged(gbContext.setAttributesClearingStickyDocs(attributes))
         refreshStickyBucketService()
         refreshForRemoteEval()
     }
@@ -541,7 +591,7 @@ class GrowthBookSDK internal constructor(
     fun updateAttributes(attributes: Map<String, GBValue>) {
         // Merge inside the context's atomic CAS loop (not read-then-setAttributes), so two concurrent
         // updateAttributes calls can't lose each other's keys. Side effects mirror setAttributes.
-        gbContext.mergeAttributesClearingStickyDocs(attributes)
+        notifyAttributesChanged(gbContext.mergeAttributesClearingStickyDocs(attributes))
         refreshStickyBucketService()
         refreshForRemoteEval()
     }
@@ -562,7 +612,7 @@ class GrowthBookSDK internal constructor(
      * ```
      */
     override suspend fun setAttributesSync(attributes: Map<String, GBValue>) {
-        gbContext.attributes = attributes
+        notifyAttributesChanged(gbContext.setAttributesReportingChange(attributes))
 
         if (gbContext.stickyBucketService != null) {
             refreshStickyBuckets(
@@ -584,7 +634,7 @@ class GrowthBookSDK internal constructor(
      */
     suspend fun updateAttributesSync(attributes: Map<String, GBValue>) {
         // Atomic merge (see updateAttributes); side effects mirror setAttributesSync.
-        gbContext.mergeAttributes(attributes)
+        notifyAttributesChanged(gbContext.mergeAttributes(attributes))
 
         if (gbContext.stickyBucketService != null) {
             refreshStickyBuckets(
@@ -673,6 +723,29 @@ class GrowthBookSDK internal constructor(
                 GB.error("GrowthBook: Failed to refresh sticky buckets on payload ready: ${e.message}", e)
             }
         }
+    }
+
+    /**
+     * Tells plugins that the instance now serves a different user, so the ones holding per-user
+     * state can reset it. Fires only when the attributes actually changed — the attribute setters
+     * are commonly called with an unchanged map on every screen, and a plugin that resets a
+     * de-duplication cache on each of those would re-send events it correctly suppressed.
+     *
+     * Deliberately not fired for [setAttributeOverrides]: overrides adjust sticky-bucket
+     * identity for the *same* user, they do not make it a different one.
+     */
+    private fun notifyAttributesChanged(published: Map<String, GBValue>?) {
+        // Null means the write changed nothing. The map is the one the winning CAS published, not a
+        // fresh read: with two setters racing, re-reading here would hand both observers the last
+        // writer's attributes and lose the user that evaluations in between actually saw.
+        if (published == null) return
+        // The next user's first evaluation of each feature is a fresh report, even when the value
+        // is the one the previous user saw. The reference SDK keeps its `trackedFeatureUsage` map
+        // across attribute changes and only clears it on destroy, which is why its own tracking
+        // plugin needs `dedupeKeyAttributes` to tell users apart; resetting here is a deliberate
+        // deviation that removes the failure at the source.
+        gbFeatureUsageHelper.reset()
+        pluginRegistry?.fireAttributesChanged(published)
     }
 
     private fun refreshStickyBucketService(dataModel: FeaturesDataModel? = null) {
@@ -769,7 +842,9 @@ class GrowthBookSDK internal constructor(
     }
 
     private fun createEvaluationContext(snapshot: EvalSnapshot = gbContext.evalSnapshot()) =
-        createEvaluationContext(gbContext, gbExperimentHelper, snapshot, pluginRegistry)
+        createEvaluationContext(
+            gbContext, gbExperimentHelper, gbFeatureUsageHelper, snapshot, pluginRegistry
+        )
 
     //@ThreadLocal
     internal companion object {
@@ -783,6 +858,7 @@ class GrowthBookSDK internal constructor(
         private fun createEvaluationContext(
             gbContext: GBContext,
             gbExperimentHelper: GBExperimentHelper,
+            gbFeatureUsageHelper: GBFeatureUsageHelper,
             // One atomic read of the whole shared state: features, savedGroups, attributes, forced
             // features/variations, attribute overrides and the sticky-bucket docs come from the SAME
             // snapshot, so the evaluation can never observe a torn mix (e.g. new features with stale
@@ -795,6 +871,7 @@ class GrowthBookSDK internal constructor(
                 features = snapshot.features,
                 savedGroups = snapshot.savedGroups,
                 gbExperimentHelper = gbExperimentHelper,
+                gbFeatureUsageHelper = gbFeatureUsageHelper,
                 loggingEnabled = gbContext.enableLogging,
                 onFeatureUsage = gbContext.onFeatureUsage,
                 forcedVariations = snapshot.forcedVariations,
@@ -813,6 +890,7 @@ class GrowthBookSDK internal constructor(
                 },
                 stackContext = StackContext(null, mutableSetOf()),
                 pluginRegistry = pluginRegistry,
+                eventLogger = gbContext.eventLogger,
                 contextualBandits = snapshot.contextualBandits
             )
         }

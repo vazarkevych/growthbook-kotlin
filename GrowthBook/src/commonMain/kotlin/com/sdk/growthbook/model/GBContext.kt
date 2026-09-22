@@ -2,6 +2,7 @@
 
 package com.sdk.growthbook.model
 
+import com.sdk.growthbook.GBEventLogger
 import com.sdk.growthbook.GBTrackingCallback
 import com.sdk.growthbook.plugin.tracking.GrowthBookPlugin
 import com.sdk.growthbook.utils.GBFeatures
@@ -131,6 +132,13 @@ class GBContext internal constructor(
      * merely documented.
      */
     val plugins: List<GrowthBookPlugin>? = null,
+
+    /**
+     * Structured sink for every event the SDK produces — the two evaluation events and explicit
+     * [com.sdk.growthbook.GrowthBookSDK.logEvent] calls. Set via
+     * [com.sdk.growthbook.GBSDKBuilder.setEventLogger].
+     */
+    val eventLogger: GBEventLogger? = null,
 ) {
 
     // Single source of truth for all cross-thread-shared evaluation inputs.
@@ -154,6 +162,28 @@ class GBContext internal constructor(
         while (true) {
             val current = state.load()
             if (state.compareAndSet(current, transform(current))) return
+        }
+    }
+
+    /**
+     * [mutate] for the attribute writes, returning the attributes this write published, or null
+     * when it changed nothing.
+     *
+     * Both the verdict and the map come off the same CAS iteration that won, so they describe the
+     * write that happened rather than a state sampled around it: two concurrent writers would
+     * otherwise each compare against — and hand observers — a map neither of them published.
+     * Callers notify observers only on a real change (see
+     * [com.sdk.growthbook.GrowthBookSDK.setAttributes]); re-setting the same map must stay silent.
+     */
+    private fun mutateReportingAttributeChange(
+        transform: (EvalSnapshot) -> EvalSnapshot
+    ): Map<String, GBValue>? {
+        while (true) {
+            val current = state.load()
+            val next = transform(current)
+            if (state.compareAndSet(current, next)) {
+                return if (current.attributes != next.attributes) next.attributes else null
+            }
         }
     }
 
@@ -200,29 +230,45 @@ class GBContext internal constructor(
      * Atomically replace the user [attributes] and clear the sticky-bucket docs in a single update.
      * Done as one swap (not two separate writes) so a concurrent reader never observes the new
      * attributes paired with the previous user's stale sticky docs.
+     *
+     * @return the attributes this write published, or null when nothing changed.
      */
-    internal fun setAttributesClearingStickyDocs(attributes: Map<String, GBValue>) = mutate {
-        it.copy(attributes = attributes, stickyBucketAssignmentDocs = null)
-    }
+    internal fun setAttributesClearingStickyDocs(attributes: Map<String, GBValue>) =
+        mutateReportingAttributeChange {
+            it.copy(attributes = attributes, stickyBucketAssignmentDocs = null)
+        }
+
+    /**
+     * Atomically replace the user [attributes], leaving the sticky-bucket docs alone — the caller
+     * (`setAttributesSync`) awaits a sticky refresh of its own right after.
+     *
+     * @return the attributes this write published, or null when nothing changed.
+     */
+    internal fun setAttributesReportingChange(attributes: Map<String, GBValue>) =
+        mutateReportingAttributeChange { it.copy(attributes = attributes) }
 
     /**
      * Atomically shallow-merge [attributes] into the current attributes (new keys added, existing
      * overwritten, others preserved). The read-merge-write happens inside the CAS loop, so two
      * concurrent merges can never lose each other's keys — unlike a read-then-[attributes]-set from
      * the caller. Mirrors the intent of [setAttributesClearingStickyDocs] for the merge case.
+     *
+     * @return the attributes this write published, or null when nothing changed.
      */
-    internal fun mergeAttributesClearingStickyDocs(attributes: Map<String, GBValue>) = mutate {
-        it.copy(attributes = it.attributes + attributes, stickyBucketAssignmentDocs = null)
-    }
+    internal fun mergeAttributesClearingStickyDocs(attributes: Map<String, GBValue>) =
+        mutateReportingAttributeChange {
+            it.copy(attributes = it.attributes + attributes, stickyBucketAssignmentDocs = null)
+        }
 
     /**
      * Atomically shallow-merge [attributes] into the current attributes without touching the
      * sticky-bucket docs (mirrors the plain [attributes] setter used by `setAttributesSync`). The
      * merge is inside the CAS loop, so concurrent merges never lose keys.
+     *
+     * @return the attributes this write published, or null when nothing changed.
      */
-    internal fun mergeAttributes(attributes: Map<String, GBValue>) = mutate {
-        it.copy(attributes = it.attributes + attributes)
-    }
+    internal fun mergeAttributes(attributes: Map<String, GBValue>) =
+        mutateReportingAttributeChange { it.copy(attributes = it.attributes + attributes) }
 
     /**
      * Atomically publish a freshly decoded payload: [features], [savedGroups] and [contextualBandits]
