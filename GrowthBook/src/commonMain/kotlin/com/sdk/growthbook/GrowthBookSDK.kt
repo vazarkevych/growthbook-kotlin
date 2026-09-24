@@ -54,7 +54,13 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlin.concurrent.atomics.AtomicLong
+import kotlin.concurrent.atomics.AtomicReference
+import kotlin.concurrent.atomics.ExperimentalAtomicApi
+import kotlin.concurrent.atomics.fetchAndUpdate
+import kotlin.concurrent.atomics.update
 import kotlin.coroutines.CoroutineContext
+import kotlin.coroutines.cancellation.CancellationException
 import kotlin.experimental.ExperimentalObjCRefinement
 import kotlin.native.HiddenFromObjC
 import kotlin.time.Duration.Companion.milliseconds
@@ -104,7 +110,7 @@ class GrowthBookSDK internal constructor(
     cachingLayer: GBCachingLayer?,
     // Internal seam only, same reasoning: set via GBSDKBuilder.setFetchStatsHandler().
     private val fetchStatsHandler: GBFetchStatsHandler? = null
-    ) : FeaturesFlowDelegate, IGrowthBookSDK {
+) : FeaturesFlowDelegate, IGrowthBookSDK {
 
     /**
      * Public constructor, kept binary-compatible with pre-7.3.0 releases. To set a cache
@@ -130,12 +136,22 @@ class GrowthBookSDK internal constructor(
         coroutineContext = PlatformDependentIODispatcher,
         cachingLayer = null
     )
+
     private var remoteSourceFeaturesFetchResult: FeaturesFetchResult =
         FeaturesFetchResult.NoResultYet
     private val gbExperimentHelper: GBExperimentHelper = GBExperimentHelper()
-    private var subscriptions: MutableList<GBExperimentRunCallback> = mutableListOf()
-    private var assigned: MutableMap<String, Pair<GBExperiment, GBExperimentResult>> =
-        mutableMapOf()
+
+    @OptIn(ExperimentalAtomicApi::class)
+    private val subscriptions =
+        AtomicReference<List<Pair<Long, GBExperimentRunCallback>>>(emptyList())
+
+    @OptIn(ExperimentalAtomicApi::class)
+    private val subscriptionIds = AtomicLong(0)
+
+    @OptIn(ExperimentalAtomicApi::class)
+    private val assigned =
+        AtomicReference<Map<String, Pair<GBExperiment, GBExperimentResult>>>(emptyMap())
+
     // True once any usable feature payload is present. Initialized from the context so
     // bundled features seeded via setInitialFeatures() before construction count as a
     // payload — otherwise a 304 arriving before the first remote fetch would be treated
@@ -344,10 +360,17 @@ class GrowthBookSDK internal constructor(
      * creating a replacement instance) to avoid leaking coroutines and threads. Safe to call
      * multiple times. The instance must not be used after [close].
      */
+    @OptIn(ExperimentalAtomicApi::class)
     fun close() {
         pluginRegistry?.closeAll()
         featuresViewModel.close()
         reactiveScope.cancel()
+        // Subscriptions and the assignment history are released here, mirroring the reference JS
+        // SDK's destroy(). The id counter is deliberately NOT reset: a GBSubscription handed out
+        // before close() still holds its id, and restarting the counter would let a later
+        // subscription reuse it, so cancelling the stale handle would unsubscribe someone else.
+        subscriptions.store(emptyList())
+        assigned.store(emptyMap())
     }
 
     /**
@@ -356,6 +379,22 @@ class GrowthBookSDK internal constructor(
     fun getFeatures(): GBFeatures {
         return gbContext.features
     }
+
+    /**
+     * Snapshot of the latest experiment assignment for every experiment this instance has evaluated,
+     * keyed by experiment key — the same data [subscribe] reports incrementally.
+     *
+     * Intended for diagnostics: a debug overlay listing the current user's variations, or attaching
+     * assignments to a crash report.
+     *
+     * It reflects what was actually evaluated, so an experiment no screen has asked for yet is
+     * absent — and, conversely, an entry survives an experiment being stopped or dropped from the
+     * payload, since nothing evaluates it any more to overwrite it. Entries are refreshed whenever a
+     * re-evaluation produces a different result, including one that only changes the value or rule
+     * id while the variation stays put.
+     */
+    @OptIn(ExperimentalAtomicApi::class)
+    fun getAllResults(): Map<String, Pair<GBExperiment, GBExperimentResult>> = assigned.load()
 
     /**
      * Delegate that fire refreshHandler with success = true when a 304 response occurs.
@@ -541,7 +580,10 @@ class GrowthBookSDK internal constructor(
         val snapshot = gbContext.evalSnapshot()
         val evalContext = createEvaluationContext(snapshot, silent)
         val evaluator = GBFeatureEvaluator(evalContext, snapshot.forcedFeatures)
-        return evaluator.evaluateFeature(featureKey = id, attributeOverrides = snapshot.attributeOverrides)
+        return evaluator.evaluateFeature(
+            featureKey = id,
+            attributeOverrides = snapshot.attributeOverrides
+        )
     }
 
     /**
@@ -669,6 +711,50 @@ class GrowthBookSDK internal constructor(
     }
 
     /**
+     * Registers [callback] to be notified whenever an experiment assignment *changes* — the
+     * variation differs from the last one reported for that experiment key, or the user entered or
+     * left the experiment. Returns a [GBSubscription]; call [GBSubscription.cancel] to stop.
+     *
+     * Not to be confused with [GBSDKBuilder.setTrackingCallback], which has an identical signature
+     * but the opposite contract:
+     *
+     * - `trackingCallback` reports an **exposure** for analytics. It is deduped per unique
+     *   hashAttribute/hashValue/key/variation and so fires at most once for each of them.
+     * - `subscribe` reports a **change** for the UI. It fires again whenever the assignment moves —
+     *   after [setAttributes] on login, a new payload from SSE or polling, [forceVariation] — and it
+     *   fires on the way out of an experiment too, so a variation can be rolled back.
+     *
+     * Subscriptions are observational: they report the evaluations the app already performs and
+     * never trigger one themselves. An experiment nothing has evaluated yet is never reported, and
+     * the reactive re-evaluations behind [featureFlow] are silent (see its KDoc), so collecting a
+     * flow does not raise assignment events for screens the user has not seen. By the same token,
+     * an experiment that is stopped and disappears from the payload raises no event — nothing
+     * evaluates it any more. Leaving an experiment is reported only when the experiment is still
+     * evaluated and reports `inExperiment = false`.
+     *
+     * Assignments are tracked per experiment key. Two experiment rules on one feature that share a
+     * key (both keyless, so both inherit the feature id) describe two different assignments under
+     * one name, so each evaluation of that feature reports both and the change check cannot settle.
+     * This matches the reference SDK; give the rules distinct keys.
+     *
+     * The callback runs synchronously on the thread that evaluated, like
+     * [GBSDKBuilder.setFeatureUsageCallback]: keep it short, do not block, and dispatch to the main
+     * thread yourself if you touch UI. A throwing callback is logged and ignored — it can neither
+     * break evaluation nor suppress the other subscribers.
+     */
+    @OptIn(ExperimentalAtomicApi::class)
+    override fun subscribe(callback: GBExperimentRunCallback): GBSubscription {
+        // Identified by a monotonic id rather than by the callback itself, so subscribing the same
+        // lambda twice yields two independent subscriptions (the reference JS SDK's Set collapses
+        // them, which makes one cancel() silently kill the other caller's subscription).
+        val id = subscriptionIds.fetchAndAdd(1)
+        subscriptions.update { it + (id to callback) }
+        return GBSubscription {
+            subscriptions.update { subs -> subs.filterNot { it.first == id } }
+        }
+    }
+
+    /**
      * Coroutine version of [updateAttributes] that awaits sticky bucket refresh before returning.
      * Shallow-merges [attributes] into the current user attributes (see [updateAttributes] for the
      * exact merge and [GBNull] semantics).
@@ -763,7 +849,10 @@ class GrowthBookSDK internal constructor(
             )
         } catch (e: Exception) {
             if (gbContext.enableLogging) {
-                GB.error("GrowthBook: Failed to refresh sticky buckets on payload ready: ${e.message}", e)
+                GB.error(
+                    "GrowthBook: Failed to refresh sticky buckets on payload ready: ${e.message}",
+                    e
+                )
             }
         }
     }
@@ -778,7 +867,10 @@ class GrowthBookSDK internal constructor(
                 )
             } catch (e: Exception) {
                 if (gbContext.enableLogging) {
-                    GB.error("GrowthBook: Failed to refresh sticky bucket assignments: ${e.message}", e)
+                    GB.error(
+                        "GrowthBook: Failed to refresh sticky bucket assignments: ${e.message}",
+                        e
+                    )
                 }
             }
         }
@@ -836,25 +928,53 @@ class GrowthBookSDK internal constructor(
         }
     }
 
-    private fun fireSubscriptions(experiment: GBExperiment, experimentResult: GBExperimentResult) {
-        val key = experiment.key
-        // If assigned variation has changed, fire subscriptions
-        val prevAssignedExperiment = this.assigned[key]
-        if (prevAssignedExperiment == null
-            || prevAssignedExperiment.second.inExperiment != experimentResult.inExperiment
-            || prevAssignedExperiment.second.variationId != experimentResult.variationId
-        ) {
-            this.assigned[key] = experiment to experimentResult
-        }
-        for (callback in subscriptions) {
+    @OptIn(ExperimentalAtomicApi::class)
+    private fun fireSubscriptions(experiment: GBExperiment, result: GBExperimentResult) {
+        val prev = swapAssigned(experiment.key, experiment to result)
+
+        val subs = subscriptions.load()
+        if (subs.isEmpty()) return
+
+        val changed = prev == null
+            || prev.second.inExperiment != result.inExperiment
+            || prev.second.variationId != result.variationId
+        if (!changed) return
+
+        for ((_, callback) in subs) {
             try {
-                callback.invoke(experiment, experimentResult)
-            } catch (e: Exception) {
+                callback.invoke(experiment, result)
+            } catch (c: CancellationException) {
+                // Evaluations can run inside coroutines (suspendFeature); swallowing cancellation
+                // would break it.
+                throw c
+            } catch (e: Throwable) {
                 if (gbContext.enableLogging) {
-                    GB.error("Error while run subscriptions: ${e.message}", e)
+                    GB.error("GrowthBook: Error while run subscriptions: ${e.message}", e)
                 }
             }
         }
+    }
+
+    /**
+     * Stores [entry] under [key] and returns the previous entry (or null).
+     *
+     * `fetchAndUpdate` (a CAS loop) rather than load-then-store: two threads evaluating the same
+     * experiment key would otherwise both read `prev == null` and both report it as a new
+     * assignment. The map is replaced wholesale, so readers of [getAllResults] always observe a
+     * consistent snapshot.
+     *
+     * An unchanged result short-circuits before that write. Every non-silent evaluation passes
+     * through here, so rewriting the map would copy it on the hot path — per feature, per
+     * recomposition — to store something indistinguishable from what is already there.
+     */
+    @OptIn(ExperimentalAtomicApi::class)
+    private fun swapAssigned(
+        key: String,
+        entry: Pair<GBExperiment, GBExperimentResult>
+    ): Pair<GBExperiment, GBExperimentResult>? {
+        val existing = assigned.load()[key]
+        if (existing != null && existing.second == entry.second) return existing
+        return assigned.fetchAndUpdate { it + (key to entry) }[key]
     }
 
     private enum class FeaturesFetchResult {
@@ -880,7 +1000,12 @@ class GrowthBookSDK internal constructor(
         // exposure fire is gated by GBExperimentHelper.isTracked(), and the throwaway helper above is
         // empty on every pass, so the dedup would never suppress anything.
         if (silent) null else pluginRegistry,
-        silent
+        silent,
+        // Same reasoning once more: a silent pass must not report assignment changes. Collecting
+        // featureFlow(id) would otherwise announce variations for screens the user never saw, and —
+        // worse — record them in `assigned`, so the real evaluation that follows would be deduped
+        // away and the subscriber would never hear about the variation actually shown.
+        if (silent) null else ::fireSubscriptions
     )
 
     //@ThreadLocal
@@ -902,7 +1027,8 @@ class GrowthBookSDK internal constructor(
             // sticky docs, or new attributes with old overrides). Callers pass the snapshot they read.
             snapshot: EvalSnapshot,
             pluginRegistry: PluginRegistry?,
-            silent: Boolean
+            silent: Boolean,
+            onExperimentEval: ((GBExperiment, GBExperimentResult) -> Unit)?
         ): EvaluationContext {
             return EvaluationContext(
                 enabled = gbContext.enabled,
@@ -927,6 +1053,7 @@ class GrowthBookSDK internal constructor(
                 },
                 stackContext = StackContext(null, mutableSetOf()),
                 pluginRegistry = if (silent) null else pluginRegistry,
+                onExperimentEval = onExperimentEval,
                 contextualBandits = snapshot.contextualBandits
             )
         }

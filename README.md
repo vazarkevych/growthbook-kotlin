@@ -275,6 +275,40 @@ You can also await a manual refresh instead of firing it and forgetting:
 val refreshed: Boolean = sdk.refreshCacheSuspend()
 ```
 
+#### Experiment assignment changes (`subscribe`)
+
+`subscribe` notifies you when an experiment assignment **changes** — the variation differs from the last one reported for that experiment key, or the user entered or left the experiment. It works from Kotlin, Java and Swift alike.
+
+```kotlin
+val subscription = sdk.subscribe { experiment, result ->
+    // The variation this user is in has changed — re-render, or update an analytics user property:
+    analytics.setUserProperty("exp_${experiment.key}", result.variationId)
+}
+
+// In onDestroy / onDisappear:
+subscription.cancel()
+```
+
+It fires again whenever the assignment moves: after `setAttributes()` on login, a new payload from SSE or polling, or `setForcedVariations()`. It also fires when an experiment is still evaluated but now reports `inExperiment == false` — a user who no longer matches the targeting — so an applied variation can be rolled back. An experiment that is *stopped* and disappears from the payload raises no event, because nothing evaluates it any more.
+
+For diagnostics — a debug overlay, or attaching assignments to a crash report — read the whole picture at once:
+
+```kotlin
+val assignments: Map<String, Pair<GBExperiment, GBExperimentResult>> = sdk.getAllResults()
+```
+
+`subscribe` and `setTrackingCallback` share the exact same `(GBExperiment, GBExperimentResult)` signature, and `featureFlow(id)` is easy to reach for instead of either — but the three answer different questions:
+
+| | Question | Fires | Typical use |
+|---|---|---|---|
+| `setTrackingCallback` | "Have I already told analytics about this exposure?" | once per unique hashAttribute/hashValue/key/variation | sending `Experiment Viewed` |
+| `subscribe` | "Has what I'm showing changed?" | on every assignment change, including leaving the experiment | re-rendering, user properties, debug overlay |
+| `featureFlow(id)` | "What value should I render?" | on every change to any evaluation input | Compose / coroutine UI state |
+
+> **Observational, never a trigger:** `subscribe` reports the evaluations your app already performs — it re-evaluates nothing on its own. An experiment nothing has evaluated yet is never reported, and the silent re-evaluations behind `featureFlow` do not raise assignment events, so collecting a flow cannot announce a variation for a screen the user has not seen.
+
+> **Threading:** the callback runs synchronously on the thread that evaluated, like `setFeatureUsageCallback` — keep it short, don't block, and dispatch to the main thread yourself if you touch UI. A callback that throws is logged and ignored: it can neither break evaluation nor suppress the other subscribers.
+
 ## Usage
 
 - Initialization returns SDK instance - GrowthBookSDK
