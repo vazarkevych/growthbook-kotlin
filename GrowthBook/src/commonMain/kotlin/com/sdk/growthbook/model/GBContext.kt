@@ -31,7 +31,9 @@ internal data class EvalSnapshot(
     val stickyBucketAssignmentDocs: StickyBucketAssignmentDocsType? = null,
     val stickyBucketIdentifierAttributes: List<String>? = null,
     val savedGroups: Map<String, GBValue>? = null,
-    val contextualBandits: Map<String, GBContextualBandit>? = null
+    val contextualBandits: Map<String, GBContextualBandit>? = null,
+    val url: String? = null,
+    val experiments: List<GBExperiment>? = null
 )
 
 /**
@@ -121,6 +123,13 @@ class GBContext internal constructor(
     savedGroups: Map<String, GBValue>? = null,
 
     /**
+     * The page URL evaluated against `experiment.urlPatterns`. Normally set via
+     * [com.sdk.growthbook.GBSDKBuilder.setUrl] and updated with
+     * [com.sdk.growthbook.GrowthBookSDK.setUrl] when the route changes.
+     */
+    url: String? = null,
+
+    /**
      * Plugins registered with the GrowthBook. See
      * [GrowthBookPlugin] and
      * [com.sdk.growthbook.plugin.tracking.GrowthBookTrackingPlugin].
@@ -140,7 +149,8 @@ class GBContext internal constructor(
             forcedVariations = forcedVariations,
             stickyBucketAssignmentDocs = stickyBucketAssignmentDocs,
             stickyBucketIdentifierAttributes = stickyBucketIdentifierAttributes,
-            savedGroups = savedGroups
+            savedGroups = savedGroups,
+            url = url
         )
     )
 
@@ -238,11 +248,13 @@ class GBContext internal constructor(
         features: GBFeatures?,
         savedGroups: Map<String, GBValue>?,
         contextualBandits: Map<String, GBContextualBandit>?,
+        experiments: List<GBExperiment>? = null,
     ) = mutate {
         it.copy(
             features = features ?: it.features,
             savedGroups = savedGroups ?: it.savedGroups,
             contextualBandits = contextualBandits ?: it.contextualBandits,
+            experiments = experiments ?: it.experiments,
         )
     }
 
@@ -271,6 +283,17 @@ class GBContext internal constructor(
         set(value) = mutate { it.copy(stickyBucketIdentifierAttributes = value) }
 
     /**
+     * The page URL matched against `experiment.urlPatterns`, and the source of the original query
+     * string when a redirect experiment sets `persistQueryString`.
+     *
+     * Shared state, like [attributes] — this SDK has no per-user scoped instance, so it is not a
+     * per-request value.
+     */
+    var url: String?
+        get() = state.load().url
+        set(value) = mutate { it.copy(url = value) }
+
+    /**
      * Saved groups used by feature/experiment conditions
      */
     var savedGroups: Map<String, GBValue>?
@@ -292,6 +315,15 @@ class GBContext internal constructor(
     internal var contextualBandits: Map<String, GBContextualBandit>?
         get() = state.load().contextualBandits
         set(value) = mutate { it.copy(contextualBandits = value) }
+
+    /**
+     * Auto-experiments from the payload — URL-redirect experiments for this SDK. Published by the
+     * payload pipeline alongside [features]; read through
+     * [com.sdk.growthbook.GrowthBookSDK.getExperiments].
+     */
+    internal var experiments: List<GBExperiment>?
+        get() = state.load().experiments
+        set(value) = mutate { it.copy(experiments = value) }
 }
 
 /**
