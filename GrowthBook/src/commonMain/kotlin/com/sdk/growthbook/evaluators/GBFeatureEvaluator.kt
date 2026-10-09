@@ -234,16 +234,22 @@ internal class GBFeatureEvaluator(
                                             track.experiment,
                                             track.result
                                         )
-                                        evaluationContext.fireExperimentViewed(
-                                            track.experiment,
-                                            track.result
-                                        )
                                     } catch (e: Exception) {
                                         GB.error(
                                             "FeatureEvaluator: trackingCallback exception for '${featureKey}'",
                                             e
                                         )
                                     }
+                                    // Outside that try on purpose: isTracked() has already marked
+                                    // this exposure, so it is never offered again. Sharing the block
+                                    // means a throwing consumer callback costs the plugins and the
+                                    // event logger a remote-eval exposure permanently. Same split as
+                                    // GBExperimentEvaluator's step 18 and prepareResult below; the
+                                    // fan-out isolates each sink itself, so it needs no try here.
+                                    evaluationContext.fireExperimentViewed(
+                                        track.experiment,
+                                        track.result
+                                    )
                                 }
                             }
                         }

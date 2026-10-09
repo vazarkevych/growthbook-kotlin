@@ -6,6 +6,7 @@ import com.sdk.growthbook.model.GBExperiment
 import com.sdk.growthbook.model.GBExperimentResult
 import com.sdk.growthbook.model.GBFeature
 import com.sdk.growthbook.model.GBFeatureResult
+import com.sdk.growthbook.model.GBFeatureRule
 import com.sdk.growthbook.model.GBFeatureSource
 import com.sdk.growthbook.model.GBString
 import com.sdk.growthbook.model.GBValue
@@ -14,6 +15,7 @@ import com.sdk.growthbook.plugin.tracking.AttributesChangeReceiver
 import com.sdk.growthbook.plugin.tracking.CustomEventReceiver
 import com.sdk.growthbook.plugin.tracking.GrowthBookPlugin
 import com.sdk.growthbook.tests.MockNetworkClient
+import com.sdk.growthbook.utils.GBTrackData
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -478,6 +480,68 @@ class PluginIntegrationTest {
 
         assertEquals(GBString("a"), result.gbValue, "evaluation survives a throwing sink")
         assertEquals(listOf<GBValue?>(GBString("a")), pluginValues)
+    }
+
+    @Test
+    fun throwingTrackingCallbackDoesNotCostPluginsARemoteEvalExposure() {
+        // The sibling of the test above, for the rule.tracks path a remote-eval payload takes.
+        // gbExperimentHelper.isTracked() marks the exposure before the callbacks run, so it is
+        // offered exactly once: a throwing trackingCallback sharing a try with the fan-out would
+        // lose it from the plugin and the event logger permanently, not just for this call.
+        val pluginExposures = mutableListOf<String>()
+        val loggedExposures = mutableListOf<String>()
+        val sdk = GBSDKBuilder(
+            apiKey = "test-key",
+            apiHost = "https://test.com",
+            attributes = mapOf("id" to GBString("u1")),
+            trackingCallback = { _, _ -> throw RuntimeException("consumer blew up") },
+            networkDispatcher = MockNetworkClient(null, null),
+        )
+            .setEventLogger { eventName, properties, _ ->
+                if (eventName == GBTrackingEventNames.EXPERIMENT_VIEWED) {
+                    loggedExposures.add((properties["experimentId"] as GBString).value)
+                }
+            }
+            .setPlugins(
+                listOf(object : GrowthBookPlugin {
+                    override fun onExperimentViewed(experiment: GBExperiment, result: GBExperimentResult, attributes: Map<String, GBValue>?) {
+                        pluginExposures.add(experiment.key)
+                    }
+                })
+            )
+            .initialize()
+        sdk.getGBContext().features = hashMapOf(
+            "remote-flag" to GBFeature(
+                rules = listOf(
+                    GBFeatureRule(
+                        id = "remote-rule",
+                        force = GBString("forced"),
+                        tracks = arrayListOf(
+                            GBTrackData(
+                                experiment = GBExperiment(
+                                    key = "remote-exp",
+                                    variations = listOf(GBString("A"), GBString("B")),
+                                ),
+                                result = GBExperimentResult(
+                                    inExperiment = true,
+                                    variationId = 1,
+                                    value = GBString("B"),
+                                    hashAttribute = "id",
+                                    hashValue = "u1",
+                                ),
+                            )
+                        ),
+                    )
+                )
+            )
+        )
+
+        val result = sdk.feature("remote-flag")
+        sdk.close()
+
+        assertEquals(GBString("forced"), result.gbValue, "evaluation survives a throwing callback")
+        assertEquals(listOf("remote-exp"), pluginExposures, "plugins still see the exposure")
+        assertEquals(listOf("remote-exp"), loggedExposures, "so does the event logger")
     }
 
     @Test

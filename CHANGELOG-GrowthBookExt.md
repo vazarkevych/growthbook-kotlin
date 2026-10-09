@@ -7,11 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [2.1.0] - Unreleased
+## [3.0.0] - Unreleased
+
+`GrowthBookExt`'s own API only gains below. The major bump propagates the breaking changes in
+`GrowthBook` 9.0.0, which this artifact exposes as an `api` dependency — upgrading here pulls the
+new core in transitively, including the silent change to how feature usage is reported. See the
+[core changelog](CHANGELOG.md#900---unreleased).
 
 ### Added
 - `eventLogger` in the configuration DSL, mirroring `GBSDKBuilder.setEventLogger`. Receives explicit
-  `GrowthBookSDK.logEvent` calls; see the [core changelog](CHANGELOG.md#810---unreleased).
+  `GrowthBookSDK.logEvent` calls; see the [core changelog](CHANGELOG.md#900---unreleased).
 
   ```kotlin
   val sdk = growthBook {

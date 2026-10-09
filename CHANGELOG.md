@@ -6,7 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
-## [8.1.0] - Unreleased
+## [9.0.0] - Unreleased
+
+A major because two public contracts change with no signature change and no compile error to
+announce them: **feature usage is reported on a value change rather than on every evaluation**, and
+**forced features report nothing at all**. Code written against 8.x keeps compiling and keeps
+running — it simply reports far less often, which a consumer discovers by noticing their numbers
+dropped. A silent contract change is worse than a signature break, not better, so it does not ship
+in a minor. See *Breaking changes* for what to check.
 
 ### Added
 - **`GrowthBookTrackingPlugin.Builder`** — a fluent builder that is now the recommended way to configure the built-in
@@ -93,6 +100,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     default no longer loses an exposure.
 
 ### Changed
+- The tracking plugin's default ingest host is now `https://us-east-1.gb-ingest.com`, catching up with
+  [growthbook#6608](https://github.com/growthbook/growthbook/pull/6608), which replaced the legacy `us1.gb-ingest.com`
+  name across the SDK, the back end, the app and the docs. **Anyone who never set `ingestorHost` explicitly is now
+  posting to a different hostname.** Both names address the us-east-1 region, so no configuration change is needed;
+  override with `setIngestorHost(...)` if your Data Region is not us-east-1.
+
+### Fixed
+- A throwing `trackingCallback` no longer costs plugins and the event logger a remote-eval exposure. On the `rule.tracks`
+  path the consumer callback and the plugin/logger fan-out shared one `try`, so a callback that threw skipped the
+  fan-out — and because `gbExperimentHelper.isTracked(...)` had already marked the exposure, it was never offered again.
+  The two are now separate, matching how `GBExperimentEvaluator`'s step 18 and `prepareResult` already handled it.
+
+### Breaking changes
+Nothing here changes a signature; all three change what an existing call *means*, which is why this is a major rather
+than a minor. Recompilation is not enough — check the three behaviours below against what your code assumes.
+
 - **Feature usage is reported on a value change, not on every evaluation.** A feature read in a recomposition or a
   render loop reports once for its first value and stays quiet until the value actually moves. This gates all three
   sinks together — `setFeatureUsageCallback`, every plugin's `onFeatureEvaluated`, and the event logger with the
@@ -117,21 +140,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `defaultValue`, `force`, `experiment`, `prerequisite`, `cyclicPrerequisite`, `unknownFeature` — reports as before,
   and the forced value itself is still served unchanged. **This is a silent behaviour change**: if you relied on the
   usage callback to observe forced features (a local debug log, for instance), read `getForcedFeatures()` instead.
-- `TrackingEvent` is now **internal**. Its `payload` is a `kotlinx.serialization` `JsonObject`, and the SDK does not
-  expose those types in its public API — this one slipped through in 7.8.0. Nothing public ever accepted or returned the
-  class, so it could be constructed but never handed anywhere: the break is limited to an `import` that no longer
-  resolves. The event names remain available as `GBTrackingEventNames.EXPERIMENT_VIEWED` / `.FEATURE_EVALUATED`, which
-  is the only part of it a caller could put to use.
-- The tracking plugin's default ingest host is now `https://us-east-1.gb-ingest.com`, catching up with
-  [growthbook#6608](https://github.com/growthbook/growthbook/pull/6608), which replaced the legacy `us1.gb-ingest.com`
-  name across the SDK, the back end, the app and the docs. **Anyone who never set `ingestorHost` explicitly is now
-  posting to a different hostname.** Both names address the us-east-1 region, so no configuration change is needed;
-  override with `setIngestorHost(...)` if your Data Region is not us-east-1.
+- **`TrackingEvent` is removed from the public API** (now `internal`), along with its constructor, its
+  `payload: JsonObject` property and the `forExperiment` / `forFeature` factories. Two reasons, and the second is why it
+  could not simply be frozen and deprecated the way `TrackingPluginConfig` was: `payload` is a `kotlinx.serialization`
+  type, which the SDK does not expose in its public API (this one slipped through in 7.8.0); and the event properties
+  are now carried as `Map<String, GBValue>` so the *same* map feeds the event filter, the event logger and the
+  serializer — which is what guarantees a filter sees exactly what gets sent. That reshaped both factories into
+  `experimentProperties` / `featureProperties`, so the old signatures no longer describe anything the SDK does.
+  - **Migration:** the only part of it a caller could put to use was the two event names. Replace
+    `TrackingEvent.EVENT_EXPERIMENT_VIEWED` with `GBTrackingEventNames.EXPERIMENT_VIEWED` and
+    `TrackingEvent.EVENT_FEATURE_EVALUATED` with `GBTrackingEventNames.FEATURE_EVALUATED`. Nothing public ever accepted
+    or returned the class, so there is nothing else to port.
 
 ### Deprecated
 - `TrackingPluginConfig` and the `GrowthBookTrackingPlugin(config, coroutineScope)` constructor that takes it. Both
   still work and are unchanged at the bytecode level — this is a warning, not a break — but they are frozen and will be
-  removed in a future major release. Migrate to the builder:
+  removed no earlier than 10.0.0. Migrate to the builder:
   ```kotlin
   // before
   GrowthBookTrackingPlugin(TrackingPluginConfig(clientKey = "sdk-abc", batchSize = 50))
@@ -142,9 +166,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unchanged and the builder applies them to any option left unset.
 
 ### Companion artifacts
-- `GrowthBookTest` **2.1.0** — `FakeGrowthBook` gained `logEvent(eventName, properties)` plus `loggedEvents()` and
+- `GrowthBookTest` **3.0.0** — `FakeGrowthBook` gained `logEvent(eventName, properties)` plus `loggedEvents()` and
   `wasLogged(name)` so custom events can be asserted on without a network or a plugin.
-- `GrowthBookExt` **2.1.0** — `eventLogger` added to the configuration DSL, mirroring the new builder setter.
+- `GrowthBookExt` **3.0.0** — `eventLogger` added to the configuration DSL, mirroring the new builder setter.
 - `Core`, `GrowthBookKotlinxSerialization`, `NetworkDispatcherKtor` and `NetworkDispatcherOkHttp` are unaffected and
   keep their current versions.
 

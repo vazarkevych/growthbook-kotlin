@@ -278,8 +278,15 @@ class GrowthBookSDK internal constructor(
      * endpoint alongside exposures. Mirrors the reference JS SDK's `logEvent`.
      *
      * The instance's current attributes are attached automatically, so the event lands with the
-     * same identity as an evaluation made at the same moment. Custom events are never
-     * de-duplicated: logging the same event twice means it happened twice.
+     * same identity as an evaluation made at the same moment. Custom events are not de-duplicated:
+     * logging the same event twice means it happened twice.
+     *
+     * The one exception, which follows the JS plugin: de-duplication branches on the event *name*
+     * alone, so naming a custom event after one of the SDK's own —
+     * [com.sdk.growthbook.plugin.GBTrackingEventNames.FEATURE_EVALUATED] or
+     * [com.sdk.growthbook.plugin.GBTrackingEventNames.EXPERIMENT_VIEWED] — puts it under their LRU
+     * and a repeat with identical properties is dropped. Pick a different name if every call must
+     * be recorded.
      *
      * Returns immediately — delivery is the logger's/plugin's concern — and never throws: a
      * failing consumer callback is logged and swallowed, exactly as evaluation callbacks are, so

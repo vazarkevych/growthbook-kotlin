@@ -922,7 +922,7 @@ GrowthBookTrackingPlugin.Builder()
 ```
 
 > **Migrating from `TrackingPluginConfig`.** `GrowthBookTrackingPlugin(TrackingPluginConfig(clientKey = "sdk-abc"))`
-> still behaves exactly as before, but the config class and the constructor that takes it are deprecated as of 8.1.0 and
+> still behaves exactly as before, but the config class and the constructor that takes it are deprecated as of 9.0.0 and
 > will be removed in a future major release. They are frozen at the options they shipped with, so anything added later
 > (starting with `enableFeatureUsageEvents`) is available through the builder only.
 

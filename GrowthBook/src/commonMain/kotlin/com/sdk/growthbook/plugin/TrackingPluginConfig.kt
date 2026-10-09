@@ -25,11 +25,11 @@ import kotlin.time.Duration.Companion.seconds
  * Deprecated at [DeprecationLevel.WARNING]: passing this config to the plugin still works and is
  * unchanged at the bytecode level, so existing code keeps running and only warns at compile time.
  * It simply cannot express options introduced after it was frozen, which take their defaults
- * instead. Removal not before 9.0.0.
+ * instead. Removal not before 10.0.0.
  */
 @Deprecated(
     message = "Configure the plugin with GrowthBookTrackingPlugin.Builder(). " +
-        "This class is frozen and will be removed no earlier than 9.0.0.",
+        "This class is frozen and will be removed no earlier than 10.0.0.",
     level = DeprecationLevel.WARNING,
 )
 data class TrackingPluginConfig(
