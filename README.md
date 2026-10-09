@@ -749,6 +749,34 @@ and without a dispatcher it buffers events and discards them. Both cases are log
 > in another region, override it — `setIngestorHost("https://eu-west-1.gb-ingest.com")` — otherwise events reach the
 > wrong cluster and are dropped.
 
+### Flushing when the app leaves the foreground
+
+Events are sent when the buffer reaches `setBatchSize(n)`, when `setBatchTimeout(duration)` expires, or on `close()`.
+That leaves one gap: a process killed while backgrounded takes its buffer with it, so up to a batch timeout's worth of
+exposures disappear without a trace. Call `flush()` on the way out to close it — it drains the buffer and leaves the
+plugin running, unlike `close()`, which shuts it down for good:
+
+```kotlin
+class App : Application(), DefaultLifecycleObserver {
+    private val tracking = GrowthBookTrackingPlugin.Builder()
+        .setClientKey("sdk-abc")
+        .setNetworkDispatcher(GBNetworkDispatcherKtor())
+        .build()
+
+    override fun onStop(owner: LifecycleOwner) = tracking.flush()   // backgrounded, not dead
+    override fun onTerminate() = tracking.close()
+}
+```
+
+The equivalent moment is `applicationDidEnterBackground` (or a `scenePhase` change) on Apple targets, and
+`visibilitychange` / `pagehide` in the browser — which is where the reference JS plugin hooks itself automatically. The
+SDK does not: it takes no dependency on any platform's lifecycle, the same reason `startPolling` / `stopPolling` are
+yours to call. Hold the plugin in a field, as above, and pick the moment yourself.
+
+`flush()` is safe to call repeatedly and with an empty buffer, and it is a no-op after `close()`. It returns once the
+batch has been handed to the network layer, **not** once it has been delivered — no dispatcher reports delivery — so it
+is worth something on the way into the background and nothing at all as the process is already dying.
+
 ### Turning off feature usage events
 
 A `Feature Evaluated` event fires when a feature's value changes, not on every read (see

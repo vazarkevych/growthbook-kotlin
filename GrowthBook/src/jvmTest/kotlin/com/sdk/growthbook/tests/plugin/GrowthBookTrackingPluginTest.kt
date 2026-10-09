@@ -202,6 +202,89 @@ class GrowthBookTrackingPluginTest {
     }
 
     @Test
+    fun flushSendsBufferedEventsAndLeavesThePluginUsable() {
+        val dispatcher = CapturingDispatcher(expectedPosts = 2)
+        // A timeout long enough that nothing but flush() can produce a batch.
+        val plugin = plugin(dispatcher, batchSize = 100, batchTimeout = 60.seconds)
+        plugin.init()
+
+        plugin.onExperimentViewed(experiment("before_background"), experimentResult())
+        plugin.flush()
+        // Still alive: the second event must be accepted and flushable, unlike after close().
+        plugin.onExperimentViewed(experiment("after_background"), experimentResult(1))
+        plugin.flush()
+
+        assertNotNull(dispatcher.waitForPost(), "flush() should drain the buffer")
+        assertEquals(2, dispatcher.posts.size, "each flush() should send its own batch")
+        val experimentIds = dispatcher.posts.flatMap { batch ->
+            (batch as JsonArray).map {
+                it.jsonObject["properties_json"]?.jsonObject?.get("experimentId")?.jsonPrimitive?.content
+            }
+        }
+        assertEquals(listOf("before_background", "after_background"), experimentIds)
+
+        plugin.close()
+    }
+
+    @Test
+    fun flushRearmsTheBatchTimerForLaterEvents() {
+        val dispatcher = CapturingDispatcher(expectedPosts = 2)
+        val plugin = plugin(dispatcher, batchSize = 100, batchTimeout = 300.milliseconds)
+        plugin.init()
+
+        plugin.onFeatureEvaluated("flag1", featureResult())
+        plugin.flush()  // cancels the armed timer
+
+        // Guards the `pendingFlush = null` in flush(): cancelling the job without clearing the
+        // handle would leave enqueue() thinking a timer is still armed, and this event would sit in
+        // the buffer until a size-triggered flush that never comes.
+        plugin.onFeatureEvaluated("flag2", featureResult())
+
+        assertNotNull(dispatcher.waitForPost(timeoutSeconds = 3), "timer must re-arm after flush()")
+        assertEquals(2, dispatcher.posts.size)
+
+        plugin.close()
+    }
+
+    @Test
+    fun flushWithNothingBufferedSendsNothing() {
+        val dispatcher = CapturingDispatcher()
+        val plugin = plugin(dispatcher, batchSize = 100, batchTimeout = 60.seconds)
+        plugin.init()
+
+        plugin.flush()
+        plugin.flush()
+
+        assertTrue(dispatcher.receivedNoPost(), "an empty buffer must not produce a POST")
+        plugin.close()
+    }
+
+    @Test
+    fun flushAfterCloseIsNoOp() {
+        val dispatcher = CapturingDispatcher()
+        val plugin = plugin(dispatcher, batchSize = 100, batchTimeout = 60.seconds)
+        plugin.init()
+        plugin.close()
+
+        plugin.flush()
+
+        assertTrue(dispatcher.receivedNoPost(), "flush() must not revive a closed plugin")
+    }
+
+    @Test
+    fun flushOnDisabledPluginSendsNothing() {
+        val dispatcher = CapturingDispatcher()
+        val plugin = plugin(dispatcher, enable = false, batchSize = 100, batchTimeout = 60.seconds)
+        plugin.init()
+
+        plugin.onExperimentViewed(experiment("exp"), experimentResult())
+        plugin.flush()
+
+        assertTrue(dispatcher.receivedNoPost(), "setEnable(false) must survive an explicit flush()")
+        plugin.close()
+    }
+
+    @Test
     fun noClientKeyDisablesPlugin() {
         val dispatcher = CapturingDispatcher()
         val plugin = plugin(dispatcher, clientKey = null, batchSize = 1)

@@ -48,6 +48,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   affected, since its properties already carry `hashAttribute`/`hashValue`, but configured attributes apply to both event
   types, matching the TS plugin's `dedupeKeyAttributes`.
 
+- **`GrowthBookTrackingPlugin.flush()`** sends whatever is buffered and leaves the plugin running, which `close()` does
+  not. Until now events left the buffer only at `setBatchSize`, on the `setBatchTimeout` timer, or on `close()` — so a
+  process killed while backgrounded took up to a batch timeout's worth of exposures with it, silently. Call it from
+  `ON_STOP` on Android, `applicationDidEnterBackground` on Apple. The reference JS plugin hooks `visibilitychange` /
+  `pagehide` itself; the SDK deliberately takes no dependency on any platform's lifecycle (the same reason
+  `startPolling` / `stopPolling` are the consumer's to call), so it exposes the drain and the host app picks the moment.
+  Safe to call repeatedly, with an empty buffer, and after `close()` (a no-op). It returns once the batch reaches the
+  network layer, not once it is delivered — no dispatcher in the SDK reports delivery.
+  It is a plain method on the plugin rather than a third opt-in plugin interface: the consumer builds the plugin and so
+  already holds the type, and an interface earns its keep only once a second buffering plugin exists — at which point
+  adding one breaks nobody.
 - **Custom events.** `GrowthBookSDK.logEvent(eventName, properties)` sends your own analytics events through the same
   pipeline as exposures, closing the gap with the reference SDKs' `logEvent` / `log_event`. The instance's current
   attributes are attached automatically, and custom events are not de-duplicated, matching the JS plugin, which

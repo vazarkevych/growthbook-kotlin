@@ -31,7 +31,8 @@ import kotlin.time.Duration
  *
  * A flush is triggered when either the buffer reaches [com.sdk.growthbook.plugin.TrackingPluginConfig.resolvedBatchSize]
  * or a timer fires after [com.sdk.growthbook.plugin.TrackingPluginConfig.resolvedBatchTimeout]. [close] schedules a final
- * flush of any remaining buffered events and then cancels the coroutine scope.
+ * flush of any remaining buffered events and then cancels the coroutine scope; [flush] drains the
+ * buffer the same way but keeps the plugin running, for the moment the app leaves the foreground.
  *
  * If the client key is null/empty the plugin becomes a no-op: event methods return immediately, no
  * HTTP traffic occurs, and [close] still completes cleanly.
@@ -214,6 +215,44 @@ class GrowthBookTrackingPlugin internal constructor(
         } catch (t: Throwable) {
             GB.warning("Tracking eventFilter threw for '$eventName'; dropping the event: $t")
             false
+        }
+    }
+
+    /**
+     * Sends whatever is buffered now and keeps the plugin running — [close]'s body without the
+     * shutdown. Safe to call repeatedly, with an empty buffer, and concurrently with evaluation.
+     *
+     * Call it when the app leaves the foreground (`ON_STOP` on Android,
+     * `applicationDidEnterBackground` / `scenePhase` on Apple). That is the window the batch timer
+     * cannot cover: a process killed in the background takes its buffer with it, so events sit
+     * there for up to the batch timeout and then vanish — silent loss, not a delay. The reference
+     * JS plugin flushes on `visibilitychange`/`pagehide`; there is no portable equivalent here,
+     * because the SDK deliberately takes no dependency on any platform's lifecycle (the same
+     * reason `startPolling`/`stopPolling` are the consumer's to call), so the SDK exposes the drain
+     * and the host app picks the moment.
+     *
+     * Returns as soon as the batch has been handed to the network layer, **not** when it has been
+     * delivered — nothing in [com.sdk.growthbook.network.TrackingNetworkDispatcher] reports
+     * delivery. A process killed right after this returns can still lose the batch; calling it on
+     * the way into the background rather than as the process dies is what makes it worth anything.
+     *
+     * Deliberately a plain method rather than another opt-in plugin interface: the plugin is built
+     * by the consumer, who therefore already holds this type. An interface would only earn its keep
+     * once a second buffering plugin exists, and adding one then breaks nobody.
+     *
+     * The pending timer is cancelled *and* cleared rather than merely cancelled: [enqueue] only
+     * starts a new one while `pendingFlush` is null, so leaving a dead job there would strand every
+     * later event in the buffer until the next size-triggered flush.
+     */
+    fun flush() {
+        if (closed || disabled) return
+        coroutineScope.launch {
+            val toFlush = mutex.withLock {
+                pendingFlush?.cancel()
+                pendingFlush = null
+                buffer.toList().also { buffer.clear() }
+            }
+            if (toFlush.isNotEmpty()) flushBatch(toFlush)
         }
     }
 
