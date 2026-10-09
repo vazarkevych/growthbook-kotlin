@@ -28,13 +28,13 @@ repositories {
 
 dependencies {
     // Add GrowthBook module:
-    implementation 'io.growthbook.sdk:GrowthBook:7.9.0'
+    implementation 'io.growthbook.sdk:GrowthBook:8.0.0'
 
     // Add Network Dispatcher you prefer:
     // 1) NetworkDispatcherKtor — supports Android, iOS, JVM, JS, Wasm
-    implementation 'io.growthbook.sdk:NetworkDispatcherKtor:1.2.0'
+    implementation 'io.growthbook.sdk:NetworkDispatcherKtor:1.3.0'
     // 2) NetworkDispatcherOkHttp — supports Android and JVM only
-    implementation 'io.growthbook.sdk:NetworkDispatcherOkHttp:1.1.1'
+    implementation 'io.growthbook.sdk:NetworkDispatcherOkHttp:1.2.0'
 }
 ```
 
@@ -448,7 +448,7 @@ targets. It adds typed feature accessors, fallback strategies, a typed `Flag<T>`
 API, and DSLs for attributes and SDK configuration.
 
 ```groovy
-implementation 'io.growthbook.sdk:GrowthBookExt:1.0.0'
+implementation 'io.growthbook.sdk:GrowthBookExt:2.0.0'
 ```
 
 ### Typed feature accessors
