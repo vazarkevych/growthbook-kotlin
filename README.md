@@ -706,7 +706,7 @@ endpoint, so you get tracking without writing a `trackingCallback`. Register it 
 ```kotlin
 val sdkInstance = GBSDKBuilder(
     apiKey = <API_KEY>,
-    hostURL = <GrowthBook_URL>,
+    apiHost = <GrowthBook_URL>,
     attributes = mapOf("id" to GBString("user-123")),
     trackingCallback = { _, _ -> },
     networkDispatcher = GBNetworkDispatcherKtor(),
@@ -721,6 +721,12 @@ val sdkInstance = GBSDKBuilder(
     )
     .initialize()
 ```
+
+> **The plugin does not inherit the SDK's network dispatcher.** It is configured separately, which is why the snippet
+> above passes one to both. Omit it and the plugin buffers events and discards every batch — it warns about this at
+> init, but nothing else signals it. The dispatcher must implement `TrackingNetworkDispatcher`, a separate interface
+> from `NetworkDispatcher`: the bundled ones satisfy it from **NetworkDispatcherKtor 1.2.0** and
+> **NetworkDispatcherOkHttp 1.1.0** onward, while a custom `NetworkDispatcher` has to implement it explicitly.
 
 Builder options. `setClientKey` and `setNetworkDispatcher` are both **required**: without a key the plugin is a no-op,
 and without a dispatcher it buffers events and discards them. Both cases are logged at init:
