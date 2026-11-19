@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.0.3](https://github.com/vazarkevych/growthbook-kotlin/compare/GrowthBookKotlinxSerialization-2.0.2...GrowthBookKotlinxSerialization-2.0.3) (2026-11-19)
+
+
+### Bug Fixes
+
+* check booleans before numbers in GBValue.from ([#290](https://github.com/vazarkevych/growthbook-kotlin/issues/290)) ([33c4eaa](https://github.com/vazarkevych/growthbook-kotlin/commit/33c4eaaaf56009007d6ae6a85af232acb8e7de34))
+* pin JVM toolchain to JDK 17 so published bytecode is Java 17 ([#251](https://github.com/vazarkevych/growthbook-kotlin/issues/251)) ([baf0317](https://github.com/vazarkevych/growthbook-kotlin/commit/baf0317642eb865de9b2c7154524e65006c77780))
+
 ## [2.0.2](https://github.com/growthbook/growthbook-kotlin/compare/GrowthBookKotlinxSerialization-2.0.1...GrowthBookKotlinxSerialization-2.0.2) (2026-11-17)
 
 
